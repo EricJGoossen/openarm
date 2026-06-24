@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+
+[project]
+name = "openarm"
+version = "0.1.0"
+description = "Arm factory and analytical IK for the OpenArm robot"
+readme = "README.md"
+requires-python = ">=3.11"  # mj-manipulator (transitive via ssik) requires 3.11+
+license = "MIT"
+authors = [
+    {name = "Eric Goossen", email = "fadago@outlook.com"},
+]
+maintainers = [
+    {name = "Eric Goossen", email = "fadago@outlook.com"},
+]
+dependencies = [
+    "numpy",
+    "mujoco",
+    "ssik>=1.1.0",
+    "cython",
+    "mj-manipulator @ git+https://github.com/personalrobotics/mj_manipulator.git",
+    "mj-environment @ git+https://github.com/personalrobotics/mj_environment.git",
+    "tsr @ git+https://github.com/personalrobotics/tsr.git",
+    "openarm-assets @ git+https://github.com/ericjgoossen/openarm_assets.git",
+]
+
+
+[tool.uv.sources]
+mj-manipulator = { workspace = true }
+mj-environment = { workspace = true }
+tsr = { workspace = true }
+openarm-assets = { workspace = true }
+
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openarm"]
+
+
+[project.urls]
+Homepage = "https://github.com/ericjgoossen/openarm"
+Repository = "https://github.com/ericjgoossen/openarm"
+Issues = "https://github.com/ericjgoossen/openarm/issues"
+
+
+[tool.ruff]
+line-length = 120
+
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I"]
+
+
+[tool.ruff.lint.per-file-ignores]
+"src/openarm/__init__.py" = ["F401"]
