@@ -28,6 +28,11 @@ from mj_manipulator.sim_context import SimContext
 from openarm_assets import get_model_path
 from openarm.openarm_left import OPENARM_LEFT_HOME, create_openarm_left_arm
 
+DECORATED_XML = (
+    "openarm_assets/src/openarm_assets/models/openarm/"
+    "generated/openarm_bimanual_decorated.xml"
+)
+
 
 def _plan_execute(arm, ctx, target_q, label: str) -> None:
     """Plan to target_q, retime, and execute; print status."""
@@ -46,7 +51,7 @@ def _plan_execute(arm, ctx, target_q, label: str) -> None:
 
 
 def main() -> None:
-    env = Environment(str(get_model_path("openarm")))
+    env = Environment(DECORATED_XML)
     arm = create_openarm_left_arm(env)
 
     with SimContext(env.model, env.data, {"openarm_left": arm},
