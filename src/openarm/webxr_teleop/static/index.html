@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WebXR Teleop Bridge</title>
+  <style>
+    :root {
+      --bg: #0b0f0f;
+      --panel: #12191a;
+      --border: #223030;
+      --text: #d7e4e2;
+      --text-dim: #7f9391;
+      --live: #4fd1c5;
+      --live-dim: #1f4441;
+      --waiting: #e0a458;
+      --lost: #e0625a;
+      --mono: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+      --sans: -apple-system, system-ui, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+    }
+
+    body {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 28px;
+      padding: 24px;
+      min-height: 100vh;
+    }
+
+    #canvas-host { display: none; }
+
+    header {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+      text-align: center;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+    }
+
+    #conn-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      font-family: var(--mono);
+      font-size: 13px;
+      transition: border-color 0.2s ease, color 0.2s ease;
+    }
+
+    #conn-pill .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--waiting);
+      box-shadow: 0 0 0 0 rgba(224, 164, 88, 0.5);
+      animation: pulse 1.6s ease-out infinite;
+    }
+
+    #conn-pill.live { color: var(--live); border-color: var(--live-dim); }
+    #conn-pill.live .dot { background: var(--live); box-shadow: 0 0 0 0 rgba(79, 209, 197, 0.5); animation: pulse-live 1.6s ease-out infinite; }
+    #conn-pill.lost { color: var(--lost); border-color: var(--lost); }
+    #conn-pill.lost .dot { background: var(--lost); animation: none; box-shadow: none; }
+
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(224, 164, 88, 0.45); }
+      100% { box-shadow: 0 0 0 8px rgba(224, 164, 88, 0); }
+    }
+    @keyframes pulse-live {
+      0% { box-shadow: 0 0 0 0 rgba(79, 209, 197, 0.45); }
+      100% { box-shadow: 0 0 0 8px rgba(79, 209, 197, 0); }
+    }
+
+    #mode-note {
+      font-size: 12px;
+      color: var(--text-dim);
+      max-width: 380px;
+      text-align: center;
+    }
+
+    #enter-ar {
+      font-family: var(--sans);
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--bg);
+      background: var(--live);
+      border: none;
+      border-radius: 10px;
+      padding: 16px 36px;
+      cursor: pointer;
+      letter-spacing: 0.01em;
+    }
+    #enter-ar:hover { filter: brightness(1.08); }
+    #enter-ar:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
+    #enter-ar:disabled { background: var(--border); color: var(--text-dim); cursor: not-allowed; }
+
+    #hands {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      width: min(560px, 100%);
+    }
+
+    .hand-card {
+      border: 1px solid var(--border);
+      background: var(--panel);
+      border-radius: 12px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      opacity: 0.45;
+      transition: opacity 0.2s ease, border-color 0.2s ease;
+    }
+    .hand-card.tracked { opacity: 1; border-color: var(--live-dim); }
+
+    .hand-card .label-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+    }
+
+    .hand-card .track-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--lost);
+    }
+    .hand-card.tracked .track-dot { background: var(--live); }
+
+    .pos-readout {
+      font-family: var(--mono);
+      font-size: 13px;
+      color: var(--text);
+      display: flex;
+      gap: 10px;
+    }
+    .pos-readout span { color: var(--text-dim); }
+
+    .bar-row {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .bar-row .bar-label {
+      display: flex;
+      justify-content: space-between;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+    .bar-track {
+      height: 5px;
+      border-radius: 3px;
+      background: #1a2323;
+      overflow: hidden;
+    }
+    .bar-fill {
+      height: 100%;
+      background: var(--live);
+      width: 0%;
+      transition: width 0.05s linear;
+    }
+
+    #hint {
+      font-size: 12px;
+      color: var(--text-dim);
+      text-align: center;
+      max-width: 420px;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>WebXR Teleop Bridge</h1>
+    <div id="conn-pill"><span class="dot"></span><span id="conn-text">Connecting...</span></div>
+    <div id="mode-note" style="display:none;"></div>
+  </header>
+
+  <button id="enter-ar">Enter AR</button>
+
+  <div id="hands">
+    <div class="hand-card" id="card-left">
+      <div class="label-row"><span>Left</span><span class="track-dot"></span></div>
+      <div class="pos-readout"><span>x</span><span id="left-x">--</span><span>y</span><span id="left-y">--</span><span>z</span><span id="left-z">--</span></div>
+      <div class="bar-row">
+        <div class="bar-label"><span>Grip</span><span id="left-grip-val">0.00</span></div>
+        <div class="bar-track"><div class="bar-fill" id="left-grip-bar"></div></div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label"><span>Trigger</span><span id="left-trigger-val">0.00</span></div>
+        <div class="bar-track"><div class="bar-fill" id="left-trigger-bar"></div></div>
+      </div>
+    </div>
+
+    <div class="hand-card" id="card-right">
+      <div class="label-row"><span>Right</span><span class="track-dot"></span></div>
+      <div class="pos-readout"><span>x</span><span id="right-x">--</span><span>y</span><span id="right-y">--</span><span>z</span><span id="right-z">--</span></div>
+      <div class="bar-row">
+        <div class="bar-label"><span>Grip</span><span id="right-grip-val">0.00</span></div>
+        <div class="bar-track"><div class="bar-fill" id="right-grip-bar"></div></div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label"><span>Trigger</span><span id="right-trigger-val">0.00</span></div>
+        <div class="bar-track"><div class="bar-fill" id="right-trigger-bar"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <p id="hint">Position and rotation should visibly change as you move each controller. If a card stays gray after entering AR, that hand isn't being tracked.</p>
+
+  <canvas id="gl-canvas" style="display:none;"></canvas>
+
+  <script>
+    const connPill = document.getElementById('conn-pill');
+    const connText = document.getElementById('conn-text');
+    const enterBtn = document.getElementById('enter-ar');
+    const canvas = document.getElementById('gl-canvas');
+    const hint = document.getElementById('hint');
+    const modeNote = document.getElementById('mode-note');
+
+    const cards = {
+      left: document.getElementById('card-left'),
+      right: document.getElementById('card-right'),
+    };
+
+    // How long a hand can go without a fresh frame before its card is
+    // shown as untracked again (covers a controller going out of view,
+    // or -- for a passive viewer -- the headset itself disconnecting).
+    const TRACK_TIMEOUT_MS = 400;
+    const lastSeen = { left: 0, right: 0 };
+
+    // Whether *this* browser can start its own AR session. A desktop
+    // browser (or any non-Quest-Browser device) can still watch live
+    // telemetry as a passive viewer -- it just receives broadcasts of
+    // whatever the headset is sending, instead of driving a session
+    // itself.
+    let arCapable = false;
+
+    async function detectArSupport() {
+      if (navigator.xr) {
+        try {
+          arCapable = await navigator.xr.isSessionSupported('immersive-ar');
+        } catch (e) {
+          arCapable = false;
+        }
+      }
+      if (!arCapable) {
+        enterBtn.style.display = 'none';
+        modeNote.style.display = 'block';
+        modeNote.textContent = 'This browser can\'t start an AR session -- showing live diagnostics from whichever headset is connected.';
+      } else {
+        // The headset's own page goes dark the moment it enters the AR
+        // session (WebXR replaces the 2D DOM), so it can never actually
+        // see these cards -- only a passive viewer on another machine
+        // can. No point rendering them here.
+        document.getElementById('hands').style.display = 'none';
+        hint.style.display = 'none';
+      }
+    }
+    detectArSupport();
+
+    function setConnState(state, label) {
+      connPill.classList.remove('live', 'lost');
+      if (state) connPill.classList.add(state);
+      connText.textContent = label;
+    }
+
+    function setHandDisplay(side, entry) {
+      const card = cards[side];
+      if (entry) {
+        lastSeen[side] = performance.now();
+        card.classList.add('tracked');
+        const [x, y, z] = entry.pose7;
+        document.getElementById(`${side}-x`).textContent = x.toFixed(3);
+        document.getElementById(`${side}-y`).textContent = y.toFixed(3);
+        document.getElementById(`${side}-z`).textContent = z.toFixed(3);
+        document.getElementById(`${side}-grip-val`).textContent = entry.grip.toFixed(2);
+        document.getElementById(`${side}-trigger-val`).textContent = entry.trigger.toFixed(2);
+        document.getElementById(`${side}-grip-bar`).style.width = `${entry.grip * 100}%`;
+        document.getElementById(`${side}-trigger-bar`).style.width = `${entry.trigger * 100}%`;
+      }
+    }
+
+    function expireStaleHands() {
+      const now = performance.now();
+      for (const side of ['left', 'right']) {
+        if (now - lastSeen[side] > TRACK_TIMEOUT_MS) {
+          cards[side].classList.remove('tracked');
+        }
+      }
+      requestAnimationFrame(expireStaleHands);
+    }
+    requestAnimationFrame(expireStaleHands);
+
+    // --- WebSocket connection to the Python bridge ---
+    // UNVERIFIED end-to-end -- built from the WebXR Input spec and
+    // XRRigidTransform's documented {x,y,z} / {x,y,z,w} fields, matching
+    // the same [x,y,z,qx,qy,qz,qw] pose format used elsewhere in this
+    // project. Not yet confirmed working against real hardware.
+    let ws = null;
+    let reconnectDelayMs = 500;
+    const MAX_RECONNECT_DELAY_MS = 5000;
+    let bridgeConnected = false;
+
+    function connectWS() {
+      const wsUrl = `wss://${location.hostname}:8765/`;
+      ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => {
+        reconnectDelayMs = 500;
+        bridgeConnected = true;
+        setConnState('live', 'Bridge connected');
+        if (arCapable) enterBtn.disabled = false;
+      };
+      ws.onclose = () => {
+        bridgeConnected = false;
+        setConnState('lost', `Disconnected, retrying in ${Math.round(reconnectDelayMs / 100) / 10}s`);
+        if (arCapable) enterBtn.disabled = true;
+        setTimeout(connectWS, reconnectDelayMs);
+        reconnectDelayMs = Math.min(reconnectDelayMs * 1.6, MAX_RECONNECT_DELAY_MS);
+      };
+      ws.onerror = () => { /* onclose fires right after; let that own the status text */ };
+      ws.onmessage = (event) => {
+        // Server-broadcast state -- same {left, right} shape this page
+        // sends when it's the active headset. Driving the display from
+        // here (rather than only from the local onXRFrame loop) is what
+        // lets a passive viewer on another machine show live telemetry
+        // for whichever headset is actually connected.
+        let data;
+        try {
+          data = JSON.parse(event.data);
+        } catch (e) {
+          return;
+        }
+        if (data.left) setHandDisplay('left', data.left);
+        if (data.right) setHandDisplay('right', data.right);
+      };
+    }
+    connectWS();
+
+    // For a passive viewer, "the WebSocket is open" and "a headset is
+    // actually running the teleop script" are different facts -- the
+    // bridge can be up for a while with nobody streaming yet. Surface
+    // that as its own pill state instead of collapsing both into one
+    // generic "connected" message. (Not needed on the headset's own
+    // page -- it has its own explicit AR-session states below.)
+    function updatePassiveViewerStatus() {
+      if (!arCapable && bridgeConnected) {
+        const now = performance.now();
+        const streaming =
+          now - lastSeen.left < TRACK_TIMEOUT_MS || now - lastSeen.right < TRACK_TIMEOUT_MS;
+        if (streaming) {
+          setConnState('live', 'Headset streaming');
+        } else {
+          setConnState(null, 'Bridge connected -- waiting for headset');
+        }
+      }
+      requestAnimationFrame(updatePassiveViewerStatus);
+    }
+    requestAnimationFrame(updatePassiveViewerStatus);
+
+    // Keeps the display awake for the duration of the session -- easy to
+    // lose track of a status screen that goes dark mid-calibration.
+    let wakeLock = null;
+    async function requestWakeLock() {
+      try {
+        if ('wakeLock' in navigator) {
+          wakeLock = await navigator.wakeLock.request('screen');
+        }
+      } catch (e) {
+        // Not fatal -- proceed without it.
+      }
+    }
+
+    let xrSession = null;
+    let xrRefSpace = null;
+    let gl = null;
+
+    enterBtn.addEventListener('click', onEnterAR);
+
+    async function onEnterAR() {
+      if (!navigator.xr) {
+        setConnState('lost', 'navigator.xr unavailable -- open this in the Quest Browser');
+        return;
+      }
+      const supported = await navigator.xr.isSessionSupported('immersive-ar');
+      if (!supported) {
+        setConnState('lost', 'immersive-ar not supported on this device/browser');
+        return;
+      }
+
+      try {
+        xrSession = await navigator.xr.requestSession('immersive-ar', {
+          optionalFeatures: ['local-floor']
+        });
+      } catch (e) {
+        setConnState('lost', 'Failed to start AR session: ' + e.message);
+        return;
+      }
+
+      enterBtn.style.display = 'none';
+      setConnState('live', 'AR session active');
+      requestWakeLock();
+
+      gl = canvas.getContext('webgl', { xrCompatible: true });
+      await gl.makeXRCompatible();
+      xrSession.updateRenderState({ baseLayer: new XRWebGLLayer(xrSession, gl) });
+
+      xrRefSpace = await xrSession.requestReferenceSpace('local-floor');
+
+      xrSession.addEventListener('end', () => {
+        setConnState(ws && ws.readyState === WebSocket.OPEN ? 'live' : 'lost', 'AR session ended');
+        enterBtn.style.display = 'block';
+        if (wakeLock) { wakeLock.release(); wakeLock = null; }
+      });
+
+      xrSession.requestAnimationFrame(onXRFrame);
+    }
+
+    function onXRFrame(time, frame) {
+      const session = frame.session;
+      session.requestAnimationFrame(onXRFrame);
+
+      // Required by the spec even though we don't render anything visible --
+      // must clear to a TRANSPARENT background or passthrough gets occluded.
+      const layer = session.renderState.baseLayer;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+      gl.clearColor(0, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+      const payload = { left: null, right: null, t: time };
+
+      for (const inputSource of session.inputSources) {
+        if (!inputSource.gripSpace || !inputSource.handedness) continue;
+        if (inputSource.handedness !== 'left' && inputSource.handedness !== 'right') continue;
+
+        const pose = frame.getPose(inputSource.gripSpace, xrRefSpace);
+        if (!pose) continue;
+
+        const p = pose.transform.position;
+        const q = pose.transform.orientation;
+
+        // Standard WebXR gamepad mapping: buttons[0] = trigger, buttons[1] = squeeze/grip.
+        // UNVERIFIED: confirm this mapping matches your Quest 3S controllers
+        // in practice -- print raw gamepad.buttons on first connection if
+        // trigger/grip values look swapped or wrong.
+        const gp = inputSource.gamepad;
+        const trigger = gp && gp.buttons[0] ? gp.buttons[0].value : 0.0;
+        const grip = gp && gp.buttons[1] ? gp.buttons[1].value : 0.0;
+
+        const entry = {
+          pose7: [p.x, p.y, p.z, q.x, q.y, q.z, q.w],
+          trigger: trigger,
+          grip: grip,
+        };
+
+        if (inputSource.handedness === 'left') payload.left = entry;
+        else payload.right = entry;
+
+        setHandDisplay(inputSource.handedness, entry);
+      }
+
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      try {
+        ws.send(JSON.stringify(payload));
+      } catch (e) {
+        // socket likely closing/reconnecting -- drop this frame silently
+      }
+    }
+  </script>
+</body>
+</html>

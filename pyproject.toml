@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 [project]
 name = "openarm"
 version = "0.1.0"
-description = "Arm factory and analytical IK for the OpenArm robot"
+description = "Arm factory, analytical IK, and WebXR teleop bridge for the OpenArm robot"
 readme = "README.md"
 requires-python = ">=3.11"  # mj-manipulator (transitive via ssik) requires 3.11+
 license = "MIT"
@@ -21,6 +21,7 @@ dependencies = [
     "mujoco",
     "ssik>=1.1.0",
     "cython",
+    "websockets",
     "mj-manipulator @ git+https://github.com/personalrobotics/mj_manipulator.git",
     "mj-environment @ git+https://github.com/personalrobotics/mj_environment.git",
     "tsr @ git+https://github.com/personalrobotics/tsr.git",
@@ -49,6 +50,9 @@ allow-direct-references = true
 [tool.hatch.build.targets.wheel]
 packages = ["src/openarm"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"src/openarm/webxr_teleop/static/index.html" = "openarm/webxr_teleop/static/index.html"
+
 
 [project.urls]
 Homepage = "https://github.com/ericjgoossen/openarm"
@@ -66,3 +70,4 @@ select = ["F", "E", "W", "I"]
 
 [tool.ruff.lint.per-file-ignores]
 "src/openarm/__init__.py" = ["F401"]
+"src/openarm/webxr_teleop/__init__.py" = ["F401"]
