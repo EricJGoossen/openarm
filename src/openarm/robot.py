@@ -45,6 +45,71 @@ class _OpenarmSimContext:
     def __exit__(self, *args):
         self._robot._active_context = None
         return self._inner.__exit__(*args)
+    
+class _OpenarmHardwareContext:
+    """Composite context: real ROS 2 hardware for actual motor commands,
+    plus a headless kinematic SimContext (same event_loop) purely as a
+    collision-checked shadow for the viewer/TeleopPanel.
+    """
+
+    def __init__(self, hw, shadow, robot: "Openarm"):
+        self._hw = hw
+        self._shadow = shadow
+        self._robot = robot
+
+    def __enter__(self):
+        self._shadow.__enter__()   # registers controller on the event loop
+        self._hw.__enter__()       # connects ROS 2, waits for action servers
+        self._robot._active_context = self
+        return self
+
+    def __exit__(self, *args):
+        self._robot._active_context = None
+        hw_ok = self._hw.__exit__(*args)
+        shadow_ok = self._shadow.__exit__(*args)
+        return hw_ok and shadow_ok
+
+    def step_cartesian(self, arm_name, position, velocity=None):
+        self._shadow.step_cartesian(arm_name, position, velocity)  # local viewer/collision
+        self._hw.step_cartesian(arm_name, position, velocity)      # real motors
+
+    def step(self, targets=None):
+        self._shadow.step(targets)
+        self._hw.step(targets)
+
+    def execute(self, item):
+        self._shadow.execute(item)
+        return self._hw.execute(item)
+
+    def sync(self):
+        self._shadow.sync()
+        self._hw.sync()
+
+    def is_running(self):
+        return self._hw.is_running()
+
+    def arm(self, name):
+        return _DualArmController(self._shadow.arm(name), self._hw.arm(name))
+
+    @property
+    def control_dt(self):
+        return self._hw.control_dt  # real cadence (500 Hz), not sim's 250 Hz default
+    
+class _DualArmController:
+    """Forwards grasp/release to both the shadow (bookkeeping/visual) and
+    the real gripper. Real result wins."""
+
+    def __init__(self, shadow_arm, hw_arm):
+        self._shadow = shadow_arm
+        self._hw = hw_arm
+
+    def grasp(self, object_name=None):
+        self._shadow.grasp(object_name)
+        return self._hw.grasp(object_name)
+
+    def release(self, object_name=None):
+        self._shadow.release(object_name)
+        self._hw.release(object_name)
 
 class _ArmScope:
     """Unified arm interface — high-level primitives + low-level Arm access.
@@ -485,6 +550,39 @@ class Openarm:
             event_loop=event_loop,
         )
         return _OpenarmSimContext(inner, self)
+    
+    def real(
+        self,
+        node_name: str = "openarm_hardware",
+        event_loop=None,
+    ) -> _OpenarmHardwareContext:
+        """Create real-hardware execution context via ROS 2.
+
+        Requires your ROS 2 arm/gripper controller nodes already running and
+        advertising the topics/actions in mj_manipulator_ros.interfaces for
+        arm names "left"/"right" (see OpenarmConfig.to_hardware_config).
+
+        Example::
+
+            loop = PhysicsEventLoop()
+            with robot.real(event_loop=loop) as ctx:
+                rig = TeleopRig(robot, ctx, loop, config)
+                run_teleop(rig, config)
+        """
+        from mj_manipulator_ros.hardware_context import HardwareContext
+
+        arms = {"left": self._left_arm, "right": self._right_arm}
+        shadow = SimContext(
+            self.model,
+            self.data,
+            arms,
+            physics=False,
+            headless=True,
+            abort_fn=self.is_abort_requested,
+            event_loop=event_loop,
+        )
+        hw = HardwareContext(self.config.to_hardware_config(), node_name=node_name)
+        return _OpenarmHardwareContext(hw, shadow, self)
     
     # Named poses
 

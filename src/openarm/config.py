@@ -336,3 +336,31 @@ class OpenarmConfig:
             base=base,
             named_poses=data.get("named_poses", {}),
         )
+    
+    def to_hardware_config(self) -> "HardwareConfig":
+        """Build a mj_manipulator_ros HardwareConfig from this robot config.
+
+        Arm names ("left"/"right") must match your real ROS 2 nodes' topic/
+        action namespacing (see mj_manipulator_ros.interfaces): e.g. "left"
+        -> /left_controller/follow_joint_trajectory,
+        /left_gripper_controller/gripper_cmd,
+        /left_controller/joint_commands.
+        """
+        from mj_manipulator_ros.config import ArmHardwareConfig, HardwareConfig
+
+        def _arm_cfg(spec: OpenarmArmSpec, name: str) -> ArmHardwareConfig:
+            gripper = self.gripper_spec_for_arm(spec)
+            return ArmHardwareConfig(
+                name=name,
+                joint_names=self.joint_names(spec),
+                has_gripper=gripper is not None,
+                gripper_open=gripper.finger_open if gripper else 0.0,
+                gripper_closed=gripper.finger_closed if gripper else 0.0,
+            )
+
+        return HardwareConfig(
+            arms=[
+                _arm_cfg(self.left_arm, "left"),
+                _arm_cfg(self.right_arm, "right"),
+            ],
+        )

@@ -34,13 +34,16 @@ mj-manipulator = { workspace = true }
 mj-environment = { workspace = true }
 tsr = { workspace = true }
 openarm-assets = { workspace = true }
+mj-manipulator-ros = { workspace = true }
 
 
 [project.optional-dependencies]
 dev = [
     "pytest",
     "ruff",
+    "pin",
 ]
+ros = ["mj-manipulator-ros"]
 
 
 [tool.hatch.metadata]
