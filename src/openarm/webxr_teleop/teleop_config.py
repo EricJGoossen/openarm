@@ -31,7 +31,6 @@ def _default_cert_file() -> Path:
 def _default_key_file() -> Path:
     return _find_repo_root(Path(__file__)) / "certs" / "key.pem"
 
-
 @dataclass
 class ClutchConfig:
     """Engage/disengage and gripper-toggle thresholds for one hand.
@@ -57,7 +56,7 @@ class ClutchConfig:
 class TimingConfig:
     """Control loop and render timing."""
 
-    target_hz: float = 500.0
+    target_hz: float = 250.0
     rendered_fps: float = 30.0
     wait_for_data_timeout: float = 5.0  # seconds to wait for the first pose
 
@@ -83,6 +82,14 @@ class WebXRBridgeConfig:
     cert_file: Path = field(default_factory=_default_cert_file)
     key_file: Path = field(default_factory=_default_key_file)
 
+@dataclass
+class ControlConfig:
+    """Teleop-only control limits. These override the arm's ArmConfig
+    defults for teleop."""
+    max_cartesian_speed: float | None = 1.0
+    max_joint_step: float | None = None
+    safety_mode: str = "allow"
+
 
 @dataclass
 class TeleopConfig:
@@ -92,6 +99,7 @@ class TeleopConfig:
     right_clutch: ClutchConfig = field(default_factory=ClutchConfig)
     timing: TimingConfig = field(default_factory=TimingConfig)
     bridge: WebXRBridgeConfig = field(default_factory=WebXRBridgeConfig)
+    control: ControlConfig = field(default_factory=ControlConfig)
     debug: bool = False
 
     @classmethod
