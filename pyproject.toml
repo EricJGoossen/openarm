@@ -22,6 +22,7 @@ dependencies = [
     "ssik>=1.1.0",
     "cython",
     "websockets",
+    "mj-viser @ git+https://github.com/personalrobotics/mj_viser.git",
     "mj-manipulator @ git+https://github.com/personalrobotics/mj_manipulator.git",
     "mj-environment @ git+https://github.com/personalrobotics/mj_environment.git",
     "tsr @ git+https://github.com/personalrobotics/tsr.git",
@@ -30,6 +31,7 @@ dependencies = [
 
 
 [tool.uv.sources]
+mj-viser = { workspace = true }
 mj-manipulator = { workspace = true }
 mj-environment = { workspace = true }
 tsr = { workspace = true }
