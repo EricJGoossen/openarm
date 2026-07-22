@@ -90,6 +90,10 @@ class ControlConfig:
     max_joint_step: float | None = None
     safety_mode: str = "allow"
 
+@dataclass
+class PhysicsConfig:
+    control_dt: float = TimingConfig.period
+
 
 @dataclass
 class TeleopConfig:
@@ -100,6 +104,7 @@ class TeleopConfig:
     timing: TimingConfig = field(default_factory=TimingConfig)
     bridge: WebXRBridgeConfig = field(default_factory=WebXRBridgeConfig)
     control: ControlConfig = field(default_factory=ControlConfig)
+    physics: PhysicsConfig = field(default_factory=PhysicsConfig)
     debug: bool = False
 
     @classmethod

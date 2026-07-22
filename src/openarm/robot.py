@@ -16,6 +16,7 @@ from mj_manipulator import (
 
 from mj_manipulator.config import ArmConfig, KinematicLimits
 from mj_manipulator.grasp_verifier import GraspVerifier
+from openarm.webxr_teleop.teleop_config import PhysicsConfig
 
 from openarm.config import OpenarmConfig, OpenarmArmSpec, OpenarmGripperSpec, setup_logging
 # TODO(mast): OpenarmMast/the linear actuator base doesn't exist as a real
@@ -518,6 +519,7 @@ class Openarm:
         viewer_fps: float = 30.0,
         headless: bool = False,
         event_loop=None,
+        physics_config: "PhysicsConfig | None" = None,
     ) -> _OpenarmSimContext:
         """Create simulation execution context.
 
@@ -548,6 +550,7 @@ class Openarm:
             entities=entities,
             abort_fn=self.is_abort_requested,
             event_loop=event_loop,
+            physics_config=physics_config,
         )
         return _OpenarmSimContext(inner, self)
     
@@ -555,6 +558,7 @@ class Openarm:
         self,
         node_name: str = "openarm_hardware",
         event_loop=None,
+        physics_config: "PhysicsConfig | None" = None,
     ) -> _OpenarmHardwareContext:
         """Create real-hardware execution context via ROS 2.
 
@@ -580,6 +584,7 @@ class Openarm:
             headless=True,
             abort_fn=self.is_abort_requested,
             event_loop=event_loop,
+            physics_config=physics_config,
         )
         hw = HardwareContext(self.config.to_hardware_config(), node_name=node_name)
         return _OpenarmHardwareContext(hw, shadow, self)
