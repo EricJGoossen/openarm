@@ -9,3 +9,5 @@ certs/
 
 # venv workspace
 .venv/
+
+COLCON_IGNORE

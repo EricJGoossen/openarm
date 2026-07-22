@@ -103,13 +103,13 @@ class _DualArmController:
         self._shadow = shadow_arm
         self._hw = hw_arm
 
-    def grasp(self, object_name=None):
+    def grasp(self, object_name=None, synchronous=True):
         self._shadow.grasp(object_name)
-        return self._hw.grasp(object_name)
+        return self._hw.grasp(object_name, synchronous=synchronous)
 
-    def release(self, object_name=None):
+    def release(self, object_name=None, synchronous=True):
         self._shadow.release(object_name)
-        self._hw.release(object_name)
+        self._hw.release(object_name, synchronous=synchronous)
 
 class _ArmScope:
     """Unified arm interface — high-level primitives + low-level Arm access.

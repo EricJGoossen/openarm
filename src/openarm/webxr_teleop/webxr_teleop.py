@@ -33,8 +33,8 @@ SIDES = ("left", "right")
 # the controller's own body axes. Fixed by the WebXR reference-space
 # convention -- not something a user would ever want to tune.
 R_CONTROLLER_TO_WORLD = np.array([
+    [1.0, 0.0, 0.0],
     [0.0, 0.0, -1.0],
-    [-1.0, 0.0, 0.0],
     [0.0, 1.0, 0.0],
 ])
 
