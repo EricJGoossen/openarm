@@ -91,23 +91,21 @@ class ControlConfig:
     safety_mode: str = "allow"
 
 @dataclass
-class PhysicsConfig:
-    control_dt: float = TimingConfig.period
-
-
-@dataclass
 class TeleopConfig:
-    """Full teleop configuration."""
-
     left_clutch: ClutchConfig = field(default_factory=ClutchConfig)
     right_clutch: ClutchConfig = field(default_factory=ClutchConfig)
     timing: TimingConfig = field(default_factory=TimingConfig)
     bridge: WebXRBridgeConfig = field(default_factory=WebXRBridgeConfig)
     control: ControlConfig = field(default_factory=ControlConfig)
-    physics: PhysicsConfig = field(default_factory=PhysicsConfig)
     debug: bool = False
 
     @classmethod
     def default(cls) -> "TeleopConfig":
-        """Default configuration for the WebXR sim demo."""
         return cls()
+
+    def to_mj_physics_config(self):
+        """Build mj_manipulator's PhysicsConfig with control_dt locked
+        to this config's loop period -- always derived, never stored
+        separately, so it can't drift from timing.target_hz."""
+        from mj_manipulator.config import PhysicsConfig, ExecutionConfig
+        return PhysicsConfig(execution=ExecutionConfig(control_dt=self.timing.period))

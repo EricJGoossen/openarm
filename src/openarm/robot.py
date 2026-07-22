@@ -16,7 +16,7 @@ from mj_manipulator import (
 
 from mj_manipulator.config import ArmConfig, KinematicLimits
 from mj_manipulator.grasp_verifier import GraspVerifier
-from openarm.webxr_teleop.teleop_config import PhysicsConfig
+from mj_manipulator.config import PhysicsConfig
 
 from openarm.config import OpenarmConfig, OpenarmArmSpec, OpenarmGripperSpec, setup_logging
 # TODO(mast): OpenarmMast/the linear actuator base doesn't exist as a real

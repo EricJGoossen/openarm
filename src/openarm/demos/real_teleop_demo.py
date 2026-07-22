@@ -31,7 +31,8 @@ def main(config: TeleopConfig | None = None) -> None:
     robot = Openarm()
     loop = PhysicsEventLoop()
 
-    with robot.real(event_loop=loop) as ctx:
+    with robot.real(event_loop=loop,
+                 physics_config=config.to_mj_physics_config()) as ctx:
         rig = TeleopRig(robot, ctx, loop, config)
         run_teleop(rig, config)
 
