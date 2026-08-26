@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 
 from mj_manipulator.event_loop import PhysicsEventLoop
-from openarm.robot import Openarm
+from openarm.robot_old import Openarm
 
 from openarm.webxr_teleop.teleop_config import TeleopConfig
 from openarm.webxr_teleop.webxr_teleop import TeleopRig, run_teleop

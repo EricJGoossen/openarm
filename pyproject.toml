@@ -22,6 +22,7 @@ dependencies = [
     "ssik>=1.1.0",
     "cython",
     "websockets",
+    "mj-manipulator-ros",
     "mj-viser @ git+https://github.com/personalrobotics/mj_viser.git",
     "mj-manipulator @ git+https://github.com/personalrobotics/mj_manipulator.git",
     "mj-environment @ git+https://github.com/personalrobotics/mj_environment.git",
@@ -44,8 +45,8 @@ dev = [
     "pytest",
     "ruff",
     "pin",
+    "lark",
 ]
-ros = ["mj-manipulator-ros"]
 
 
 [tool.hatch.metadata]

@@ -329,8 +329,8 @@ class OpenarmConfig:
 
         return cls(
             model_path=Path(data["model_path"]),
-            left_arm=OpenarmArmSpec(**data["left_arm"]),
-            right_arm=OpenarmArmSpec(**data["right_arm"]),
+            left_arm=OpenarmArmSpec(**data["left"]),
+            right_arm=OpenarmArmSpec(**data["right"]),
             left_gripper=left_gripper,
             right_gripper=right_gripper,
             base=base,

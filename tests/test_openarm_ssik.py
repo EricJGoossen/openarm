@@ -27,6 +27,7 @@ a stale URDF, wrong joint ordering, etc. -- that ssik's self-check can't.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import time
 from pathlib import Path
 
@@ -220,6 +221,13 @@ def _best_residual(pin, model, data, arm, q_full, arm_q_indices, sols, T_target)
 
 
 def _pin_model_for(module_name: str):
+    spec = importlib.util.find_spec("pinocchio")
+    if spec is not None and spec.origin is not None and spec.origin.startswith("/opt/ros/"):
+        pytest.skip(
+            "pinocchio is provided by the ROS install in this environment, "
+            "and importing it crashes under pytest/Python 3.12"
+        )
+
     pin = pytest.importorskip("pinocchio", reason="pinocchio (optional dep 'pin') not installed")
     urdf_path = URDF_PATHS.get(module_name)
     if not urdf_path:
