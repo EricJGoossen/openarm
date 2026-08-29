@@ -520,8 +520,8 @@ class Openarm:
             if name is None:
                 continue
             key_qpos = self.model.key_qpos[key_id]
-            left_qpos = [float(key_qpos[i]) for i in self._arm_group.arms["left"].joint_qpos_indices]
-            right_qpos = [float(key_qpos[i]) for i in self._arm_group.arms["right"].joint_qpos_indices]
+            left_qpos = [float(key_qpos[i]) for i in self._arm_group["left"].joint_qpos_indices]
+            right_qpos = [float(key_qpos[i]) for i in self._arm_group["right"].joint_qpos_indices]
             poses[name] = {"left": left_qpos, "right": right_qpos}
         return poses
 
