@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 import numpy as np
-from mj_manipulator.config import KinematicLimits
+from mj_manipulator.config import KinematicLimits, PhysicsConfig
 
 # Try to import openarm_assets for model paths, fall back to None if not installed
 try:
@@ -244,6 +244,7 @@ class OpenarmConfig:
     left_gripper: OpenarmGripperSpec | None = None
     right_gripper: OpenarmGripperSpec | None = None
     base: OpenarmMastConfig | None = None
+    physics_config: PhysicsConfig | None = None
     named_poses: dict[str, dict[str, list[float]]] = field(default_factory=dict)
     planning: PlanningConfig = field(default_factory=PlanningConfig)
     debug: DebugConfig = field(default_factory=DebugConfig.from_env)
@@ -360,7 +361,7 @@ class OpenarmConfig:
 
         return HardwareConfig(
             arms=[
-                _arm_cfg(self.left_arm, "left"),
-                _arm_cfg(self.right_arm, "right"),
+                _arm_cfg(self.left_arm, "left_arm"),
+                _arm_cfg(self.right_arm, "right_arm"),
             ],
         )

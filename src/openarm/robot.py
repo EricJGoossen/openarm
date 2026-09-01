@@ -104,6 +104,13 @@ class _ShadowArmController:
         self._shadow.release(object_name)
         self._hw.release(object_name, synchronous=synchronous)
 
+    def set_width(self, width, synchronous=True):
+        self._shadow.set_width(width)
+        return self._hw.set_width(width, synchronous=synchronous)
+
+    def get_width(self):
+        return self._shadow.get_width()
+
 class _ArmScope:
     """Provides access to an arm by name, e.g., robot.left or robot.right."""
 
@@ -144,12 +151,23 @@ class _ArmScope:
         return self._robot.plan_to_tsrs({self._name: target})
 
     def set_gripper_width(self, target: float, synchronous: bool = True) -> bool:
-        """Set the width of the grippers."""
-        return self._robot.set_gripper_width({self._name: target}, synchronous=synchronous)
+        """Set the width of the gripper.
+
+        Args:
+            target: Desired gripper width, 0.0 (closed) to 1.0 (open).
+            synchronous: On real hardware (inside `with robot.real()`),
+                blocks until the physical gripper finishes moving. In
+                sim, or with no active context, application is instant
+                and this has no effect.
+        """
+        ctx = self._robot._active_context
+        if isinstance(ctx, OpenarmRealContext):
+            return ctx.arm(self._name).set_width(target, synchronous=synchronous)
+        return self._arm.gripper.set_width(target)
 
     def get_gripper_width(self) -> float:
         """Get the current width of the grippers."""
-        return self._arm.get_gripper_width()
+        return self._arm.gripper.get_width()
 
     def check_collisions(self) -> bool:
         """Check for collisions in the current state."""
@@ -372,6 +390,14 @@ class Openarm:
         hw = HardwareContext(self.config.to_hardware_config(), node_name=self.config.physics_config.node_name)
         return OpenarmRealContext(hw, shadow, self)
 
+    def __getattr__(self, name: str) -> Any:
+        """Allow access to arms via robot.left or robot.right."""
+        return getattr(self._arm_group, name)
+
+    def __dir__(self) -> list[str]:
+        """Include arm names in dir(robot)."""
+        return sorted(set(super().__dir__()) | set(dir(self._arm)))
+
     @property
     def left(self) -> _ArmScope:
         """Left arm scope."""
@@ -387,41 +413,80 @@ class Openarm:
         """All arms, keyed by side name."""
         return self._arm_group
 
+    @property
+    def env(self) -> Environment:
+        """Underlying MuJoCo environment."""
+        return self._env
+
+    @property
+    def _active_context(self):
+        return self._context
+
+    @_active_context.setter
+    def _active_context(self, ctx):
+        self._context = ctx
+
     # -----------------------------------------------------------------
     # Path planning
     # -----------------------------------------------------------------
 
-    def plan_ee_to_pose(
-        self,
-        goal: dict[str, list[np.ndarray] | None] = None,
-    ) -> PlanGroupResult | None:
-        """Plan a trajectory for the end effectors to reach the target poses."""
-        pass
+    def _package_plan(self, path: list[np.ndarray] | None):
+        """Retime a raw geometric path and split it into per-arm trajectories.
+ 
+        Each plan_* method below only needs to produce the raw combined
+        path; this does the retime + split + wrap-into-PlanGroupResult
+        that all of them do identically afterward.
+        """
+        if path is None:
+            return None
+        combined = self._arm_group.retime(path)
+        split = combined.split_trajectory(self._arm_group)
+        return PlanGroupResult.from_trajectories(split)
 
-    def plan_to_configuration(
-        self,
-        goal: dict[str, list[np.ndarray] | None] = None,
-    ) -> PlanGroupResult | None:
+    def plan_to_configuration(self, goal, **kwargs):
         """Plan a trajectory for the arms to reach the target joint configurations."""
-        pass
+        return self._package_plan(self._arm_group.plan_to_configuration(goal, **kwargs))
 
-    def plan_to_tsrs(
-        self,
-        goal: dict[str, list[np.ndarray] | None] = None,
-    ) -> PlanGroupResult | None:
+    def plan_ee_to_pose(self, goal, **kwargs):
+        """Plan a trajectory for the end effectors to reach the target poses.
+ 
+        Note: translates to ArmGroup.plan_to_poses at the boundary -- the
+        naming differs deliberately (openarm's public API is end-effector-
+        pose-focused; ArmGroup's is the generic mj_manipulator name), not
+        by oversight. See item C.6.
+        """
+        return self._package_plan(self._arm_group.plan_to_poses(goal, **kwargs))
+
+    def plan_to_tsrs(self, goal, **kwargs):
         """Plan a trajectory for the arms to reach the target TSRs."""
-        pass
+        return self._package_plan(self._arm_group.plan_to_tsrs(goal, **kwargs))
 
     def plan_reach_to_pose(
         self,
         goal: list[np.ndarray]
     ) -> PlanGroupResult | None:
         """Plans a trajectory for the arm closest to the first waypoint in the goal list to reach the target poses."""
-        pass
+        if not goal:
+            raise ValueError("goal must contain at least one waypoint")
 
-    def execute(self, plan: PlanGroupResult, synchronous: bool = True) -> bool:
-        """Execute a planned trajectory."""
-        pass
+        first_target_pos = np.asarray(goal[0])[:3, 3]
+
+        closest_arm = min(
+            self._arm_group.keys(),
+            key=lambda name: float(
+                np.linalg.norm(self._arm_group[name].get_ee_pose()[:3, 3] - first_target_pos)
+            ),
+        )
+
+        return self.plan_ee_to_pose({closest_arm: goal})
+
+    def execute(self, plan, synchronous: bool = True) -> bool:
+        ctx = self._active_context
+        if ctx is None:
+            raise RuntimeError(
+                "No active execution context. Use 'with robot.sim() as ctx:' or 'with robot.real() as ctx:'"
+            )
+        return ctx.execute(plan)
 
     def retime_plan(self, plan: PlanGroupResult) -> PlanGroupResult | None:
         """Retime a planned trajectory to respect velocity and acceleration limits."""
@@ -437,12 +502,37 @@ class Openarm:
     # -----------------------------------------------------------------
 
     def set_gripper_width(self, target: dict[str, float], synchronous: bool = True) -> bool:
-        """Set the width of the grippers."""
-        pass
+        """Set the width of the grippers.
+
+        Args:
+            target: Map of arm name -> desired gripper width, 0.0 (closed)
+                to 1.0 (open).
+            synchronous: On real hardware (inside `with robot.real()`),
+                blocks until each physical gripper finishes moving. In
+                sim, or with no active context, application is instant
+                and this has no effect.
+        """
+        ctx = self._active_context
+        for name, width in target.items():
+            gripper = self._arm_group[name].gripper
+            if gripper is None:
+                logger.warning("No gripper found for %s", name)
+                return False
+            if isinstance(ctx, OpenarmRealContext):
+                if not ctx.arm(name).set_width(width, synchronous=synchronous):
+                    return False
+            else:
+                gripper.set_width(width)
+        self.forward()
+        return True
 
     def get_gripper_width(self) -> dict[str, float]:
         """Get the current width of the grippers."""
-        pass
+        return {
+            name: arm.gripper.get_width()
+            for name, arm in self._arm_group.items()
+            if arm.gripper is not None
+        }
 
     # -----------------------------------------------------------------
     # Proprioception
@@ -507,6 +597,56 @@ class Openarm:
     def is_abort_requested(self) -> bool:
         """Check if a global abort has been requested."""
         return self._abort_event.is_set()
+
+    # -----------------------------------------------------------------
+    # Environment sync
+    # -----------------------------------------------------------------
+
+    def forward(self) -> None:
+        """Run forward kinematics and sync viewer."""
+        mujoco.mj_forward(self.model, self.data)
+        if self._context is not None:
+            self._context.sync()
+
+    def setup_scene(self, fixtures: dict[str, list[list[float]]] | None = None) -> None:
+        """Set up the scene: place fixtures and ready the robot."""
+        fixtures = fixtures or {}
+        self._fixtures = fixtures
+
+        for obj_type, positions in fixtures.items():
+            for pos in positions:
+                self._env.registry.activate(obj_type, pos=list(pos))
+
+        if "ready" in self._named_poses:
+            for side, arm in self._arm_group.items():   # Mapping access, not .arms.items()
+                q = np.array(self._named_poses["ready"][side])
+                for i, idx in enumerate(arm.joint_qpos_indices):
+                    self.data.qpos[idx] = q[i]
+
+        self.forward()
+
+    def reset(self) -> None:
+        """Reset the scene to its initial state."""
+        if self._context is not None:
+            self._context.reset_to_keyframe("ready")
+        else:
+            key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, "ready")
+            if key_id != -1:
+                mujoco.mj_resetDataKeyframe(self.model, self.data, key_id)
+            else:
+                mujoco.mj_resetData(self.model, self.data)
+
+        for arm in self._arm_group.values():   # Mapping access
+            arm._ft_tare_offset = np.zeros(6)
+
+        if self._env.registry is not None:
+            hide_pos = self._env.hide_pos
+            for qpos_adr in self._freejoint_qpos_addrs:
+                self.data.qpos[qpos_adr : qpos_adr + 3] = hide_pos
+            for name in list(self._env.registry.active_objects):
+                self._env.registry.hide(name)
+
+        self.setup_scene(fixtures=getattr(self, "_fixtures", None))
 
     # -----------------------------------------------------------------
     # Helpers
