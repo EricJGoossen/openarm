@@ -27,7 +27,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from openarm.robot_old import Openarm
+from openarm.robot import Openarm
 from openarm.config import OpenarmConfig
 
 

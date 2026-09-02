@@ -236,7 +236,16 @@ class Openarm:
         self.grasp_manager: GraspManager = GraspManager(self.model, self.data)
 
         # Create arms from mj_manipulator
-        self._arm_group = self._create_arm_group([self.config.left_arm, self.config.right_arm])
+        self._arm_group = self._create_arm_group(
+            {"left": self.config.left_arm, "right": self.config.right_arm}
+        )
+
+        # Cache freejoint qpos addresses (for hide-all in reset)
+        self._freejoint_qpos_addrs = [
+            self.model.jnt_qposadr[i]
+            for i in range(self.model.njnt)
+            if self.model.jnt_type[i] == mujoco.mjtJoint.mjJNT_FREE
+        ]
 
         # Create base (if configured).
         self._base: OpenarmMast | None = None
@@ -306,16 +315,16 @@ class Openarm:
 
         return arm
 
-    def _create_arm_group(self, specs: list[OpenarmArmSpec]) -> ArmGroup:
-        """Create an ArmGroup from a list of OpenarmArmSpec."""
+    def _create_arm_group(self, specs: dict[str, OpenarmArmSpec]) -> ArmGroup:
+        """Create an ArmGroup from a mapping of side name ("left"/"right") to OpenarmArmSpec."""
         arms = {}
-        for spec in specs:
+        for name, spec in specs.items():
             arm = self._create_arm(spec, spec.prefix)
-            arms[spec.name] = arm
+            arms[name] = arm
         group_config = ArmGroupConfig(
             name="bimanual",
             entity_type="arm_group",
-            joint_names=sum([self.config.joint_names(spec) for spec in specs], []),
+            joint_names=sum([self.config.joint_names(spec) for spec in specs.values()], []),
         )
         return ArmGroup(arms, group_config)
 
