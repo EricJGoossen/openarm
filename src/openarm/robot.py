@@ -441,14 +441,25 @@ class Openarm:
 
     def _package_plan(self, path: list[np.ndarray] | None):
         """Retime a raw geometric path and split it into per-arm trajectories.
- 
+
         Each plan_* method below only needs to produce the raw combined
         path; this does the retime + split + wrap-into-PlanGroupResult
         that all of them do identically afterward.
+
+        retime() can find that no amount of re-densifying the path clears a
+        collision the retimed spline dips into (the geometric path itself
+        ran the obstacle too close for retiming to recover) and raise
+        RuntimeError. That's a failed plan, same as any other infeasible
+        path -- treat it like the None case so callers already looping over
+        planning attempts (e.g. different seeds) handle it the same way.
         """
         if path is None:
             return None
-        combined = self._arm_group.retime(path)
+        try:
+            combined = self._arm_group.retime(path)
+        except RuntimeError as e:
+            logger.info("plan retiming failed: %s", e)
+            return None
         split = combined.split_trajectory(self._arm_group)
         return PlanGroupResult.from_trajectories(split)
 
