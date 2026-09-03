@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 
 from mj_manipulator.event_loop import PhysicsEventLoop
-from openarm.robot_old import Openarm
+from openarm.robot import Openarm
 
 from openarm.webxr_teleop.teleop_config import TeleopConfig
 from openarm.webxr_teleop.webxr_teleop import TeleopRig, run_teleop
@@ -33,8 +33,7 @@ def main(config: TeleopConfig | None = None) -> None:
     robot = Openarm()
     loop = PhysicsEventLoop()
 
-    with robot.sim(physics=False, headless=True, event_loop=loop,
-                physics_config=config.to_mj_physics_config()) as ctx:
+    with robot.sim(physics=False, headless=True, event_loop=loop) as ctx:
         rig = TeleopRig(robot, ctx, loop, config)
         run_teleop(rig, config)
 

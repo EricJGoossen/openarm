@@ -497,10 +497,6 @@ class Openarm:
             )
         return ctx.execute(plan)
 
-    def retime_plan(self, plan: PlanGroupResult) -> PlanGroupResult | None:
-        """Retime a planned trajectory to respect velocity and acceleration limits."""
-        self.arms.retime(plan.arm_trajectory, self.config.kinematic_limits)
-
     @property
     def named_poses(self) -> dict[str, dict[str, list[float]]]:
         """Named poses from config and keyframes."""
