@@ -88,6 +88,21 @@ class OpenarmRealContext:
     def control_dt(self):
         return self._hw.control_dt  # real cadence (500 Hz), not sim's 250 Hz default
 
+    @property
+    def ownership(self):
+        return self._shadow.ownership
+
+    @property
+    def _event_loop(self):
+        return self._shadow._event_loop
+
+    def reset_to_keyframe(self, name):
+        """Reset the shadow's MuJoCo state only -- there is no such thing
+        as teleporting a real robot. The physical arm's actual position is
+        whatever it physically is; this just re-syncs the local
+        collision-checked model used for planning/viewer/ownership."""
+        self._shadow.reset_to_keyframe(name)
+
 class _ShadowArmController:
     """Forwards grasp/release to both the shadow (bookkeeping/visual) and
     the real gripper. Real result wins."""
