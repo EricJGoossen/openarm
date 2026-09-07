@@ -166,6 +166,40 @@ class TestArmVsArmCollision:
             f"{colliding_waypoints[0][1]}"
         )
 
+    @pytest.mark.parametrize("seed", range(N_RANDOM_PAIRS))
+    def test_random_bimanual_ee_pose_plan_has_no_cross_arm_contact_at_any_waypoint(self, robot, seed):
+        """Same fuzz as TestArmVsArmCollision, routed through `plan_ee_to_pose`
+        instead of `plan_to_configuration` -- Stage 0 requires this be
+        demonstrated for each real planning entry point separately, not assumed
+        to share behavior with the joint-space version just because the
+        underlying code may overlap.
+        """
+        
+        rng = np.random.default_rng(2000 + seed)
+        left_pose = robot.left.arm.get_ee_pose().copy()
+        right_pose = robot.right.arm.get_ee_pose().copy()
+        left_pose[:3, 3] += rng.uniform(-0.08, 0.08, size=3)
+        right_pose[:3, 3] += rng.uniform(-0.08, 0.08, size=3)
+ 
+        result = robot.plan_ee_to_pose({"left": left_pose, "right": right_pose}, seed=seed, timeout=20.0)
+        if result is None or not result.success:
+            pytest.skip("planner could not reach this random Cartesian goal pair")
+ 
+        checker = _combined_checker(robot)
+        n = result.left.num_waypoints
+        assert n == result.right.num_waypoints
+ 
+        colliding_waypoints = [
+            i
+            for i in range(n)
+            if _cross_arm_contacts(checker, result.left.positions[i], result.right.positions[i])
+        ]
+        assert not colliding_waypoints, (
+            f"seed={seed}: {len(colliding_waypoints)}/{n} synchronized waypoints have a "
+            f"left-vs-right contact under plan_ee_to_pose, e.g. at waypoint "
+            f"{colliding_waypoints[0]}"
+        )
+
     def test_goal_and_ready_pose_are_self_consistent(self, robot):
         """Regression guard for the oracle itself: the all-zeros ready
         pose must read as collision-free, or every test above is
@@ -174,7 +208,6 @@ class TestArmVsArmCollision:
         q_ready_l = robot.left.arm.get_joint_positions()
         q_ready_r = robot.right.arm.get_joint_positions()
         assert _cross_arm_contacts(checker, q_ready_l, q_ready_r) == []
-
 
 # ---------------------------------------------------------------------------
 # Arm-vs-environment: static obstacle in the scene

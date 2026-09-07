@@ -236,6 +236,75 @@ class TestTsrBimanualPlanning:
         result = robot.plan_to_tsrs({"left": tsr}, seed=0, samples=8, timeout=20.0)
         assert result is not None and result.success, "planner failed on a small-volume TSR with slack"
 
+    def _reach_into_other_workspace_local(self):
+        """Local duplicate of test_openarm_bimanual_planning.py's
+        `_reach_into_other_workspace` -- see that file for how these values were
+        derived and how to re-derive them if the URDF/collision geometry ever
+        changes. Duplicated here rather than imported, matching this repo's
+        existing convention of not depending on import order between test
+        modules (see _assert_within_limits in this same file).
+        """
+        qL_goal = np.array([-0.97019901, -0.60228936, 1.19591137, 2.38015869, -0.85566228, -0.33569914, 0.43686219])
+        qR_goal = np.array([1.38920022, -0.1051121, 0.91826051, 1.15166886, 1.53557046, -0.10184814, -1.18932409])
+        return qL_goal, qR_goal
+    
+    
+    def _straight_line_local(self, q_start, q_goal, n=25):
+        q_start, q_goal = np.asarray(q_start), np.asarray(q_goal)
+        return [q_start + (q_goal - q_start) * t for t in np.linspace(0.0, 1.0, n)]
+    
+    
+    # add this method inside class TestTsrBimanualPlanning:
+    def test_bimanual_tsr_goal_solves_a_proven_adversarial_crossing(self, robot):
+        """Same two-step proof used for the joint-space and pose-space entry
+        points: prove the naive independent straight-line execution of this
+        goal pair actually collides, then require plan_to_tsrs's result to be
+        collision-free at every synchronized waypoint. The existing collision
+        test in this class (test_bimanual_tsr_goal_has_no_cross_arm_contact_
+        at_any_waypoint) uses a modest bilateral offset that was never proven
+        adversarial -- this closes that gap by reusing the joint-space module's
+        already-adversarial pair, converted to point-TSRs via forward
+        kinematics.
+        """
+        qL_start = np.asarray(robot.left.get_joint_positions(), dtype=float)
+        qR_start = np.asarray(robot.right.get_joint_positions(), dtype=float)
+        qL_goal, qR_goal = self._reach_into_other_workspace_local()
+    
+        checker = _combined_checker(robot)
+    
+        def pair_collision_free(qL, qR):
+            return not _cross_arm_contacts(checker, qL, qR)
+    
+        assert pair_collision_free(qL_start, qR_start), "start configuration already collides -- fixture issue"
+        assert pair_collision_free(qL_goal, qR_goal), "goal pair itself collides"
+    
+        left_line = self._straight_line_local(qL_start, qL_goal)
+        right_line = self._straight_line_local(qR_start, qR_goal)
+        assert any(not pair_collision_free(qL, qR) for qL, qR in zip(left_line, right_line)), (
+            "adversarial pair is not adversarial in this model -- re-sync with "
+            "test_openarm_bimanual_planning.py's _reach_into_other_workspace"
+        )
+    
+        poseL_goal, poseR_goal = robot.arms.forward_kinematics(np.concatenate([qL_goal, qR_goal]))
+    
+        result = robot.plan_to_tsrs(
+            {"left": _point_tsr(poseL_goal), "right": _point_tsr(poseR_goal)}, seed=0, timeout=30.0
+        )
+        assert result is not None and result.success, (
+            "plan_to_tsrs failed for a goal pair known reachable via plan_to_configuration"
+        )
+    
+        n = result.left.num_waypoints
+        assert result.right.num_waypoints == n
+        colliding = [
+            i
+            for i in range(n)
+            if _cross_arm_contacts(checker, result.left.positions[i], result.right.positions[i])
+        ]
+        assert not colliding, (
+            f"TSR bimanual plan collides at waypoints {colliding[:5]} despite a proven adversarial goal"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 2. Determinism
@@ -360,6 +429,45 @@ class TestBimanualGoalAtomicity:
 
         assert np.array_equal(robot.left.arm.get_joint_positions(), q_left_before)
         assert np.array_equal(robot.right.arm.get_joint_positions(), q_right_before)
+
+    def test_one_arm_unreachable_pose_fails_whole_ee_pose_plan(self, robot):
+        """Same atomicity bar as test_one_arm_unreachable_goal_fails_the_whole_plan,
+        applied to plan_ee_to_pose: a good, reachable pose goal for one arm
+        paired with a target far outside the other arm's physical reach must
+        fail the whole call, not silently move only the good arm.
+        """
+        good_left_pose = robot.left.arm.get_ee_pose().copy()
+        good_left_pose[:3, 3] += np.array([0.03, 0.0, 0.0])
+    
+        unreachable_right_pose = robot.right.arm.get_ee_pose().copy()
+        unreachable_right_pose[:3, 3] += np.array([5.0, 5.0, 5.0])  # far beyond any physical reach
+    
+        result = robot.plan_ee_to_pose(
+            {"left": good_left_pose, "right": unreachable_right_pose}, seed=0, timeout=15.0
+        )
+        assert result is None or not result.success, (
+            "plan_ee_to_pose reported success for a bimanual goal where one arm's target pose "
+            "is physically unreachable -- the bad goal was not actually checked"
+        )
+    
+    
+    def test_one_arm_unreachable_tsr_fails_whole_tsr_plan(self, robot):
+        """Same atomicity bar, applied to plan_to_tsrs."""
+        good_left_pose = robot.left.arm.get_ee_pose().copy()
+        good_left_pose[:3, 3] += np.array([0.03, 0.0, 0.0])
+    
+        unreachable_right_pose = robot.right.arm.get_ee_pose().copy()
+        unreachable_right_pose[:3, 3] += np.array([5.0, 5.0, 5.0])
+    
+        result = robot.plan_to_tsrs(
+            {"left": _point_tsr(good_left_pose), "right": _point_tsr(unreachable_right_pose)},
+            seed=0,
+            timeout=15.0,
+        )
+        assert result is None or not result.success, (
+            "plan_to_tsrs reported success for a bimanual goal where one arm's TSR target "
+            "is physically unreachable"
+        )
 
 
 # ---------------------------------------------------------------------------

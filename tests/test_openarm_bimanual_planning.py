@@ -349,6 +349,69 @@ def test_crossing_goal_is_solved_without_arm_arm_collision(robot):
     assert np.allclose(qL_end, qL_goal, atol=1e-2), "left arm did not reach its goal"
     assert np.allclose(qR_end, qR_goal, atol=1e-2), "right arm did not reach its goal"
 
+def test_crossing_goal_is_solved_without_arm_arm_collision_via_ee_pose(robot):
+    """Same two-step proof as test_crossing_goal_is_solved_without_arm_arm_collision,
+    routed through `plan_ee_to_pose` instead of `plan_to_configuration`. This
+    is a separate public entry point into the same `_package_plan` machinery,
+    and Stage 0 of the Definition of Done requires it be demonstrated
+    separately, not assumed to share behavior just because the underlying
+    code path might overlap.
+ 
+    Reuses `_reach_into_other_workspace`'s already-proven-adversarial joint
+    goal pair, converted to EE poses via `robot.arms.forward_kinematics`
+    (which takes the full concatenated left+right vector and returns
+    `[pose_left, pose_right]` in that order, matching `OpenarmConfig.default()`'s
+    left-then-right arm ordering) -- so this test exercises the pose-goal code
+    path while reusing a pair already known to produce a real crossing.
+    """
+    qL_start = np.asarray(robot.left.get_joint_positions(), dtype=float)
+    qR_start = np.asarray(robot.right.get_joint_positions(), dtype=float)
+    qL_goal, qR_goal = _reach_into_other_workspace(robot)
+ 
+    assert _is_pair_collision_free(robot, qL_start, qR_start), (
+        "start configuration already reports an arm-arm collision -- fixture/reset issue"
+    )
+    assert _is_pair_collision_free(robot, qL_goal, qR_goal), (
+        "goal pair itself collides; this should be the same pair already verified by "
+        "the joint-space version of this test"
+    )
+ 
+    left_line = _straight_line(qL_start, qL_goal)
+    right_line = _straight_line(qR_start, qR_goal)
+    naive_collides = any(
+        not _is_pair_collision_free(robot, qL, qR) for qL, qR in zip(left_line, right_line)
+    )
+    assert naive_collides, (
+        "adversarial scenario is not adversarial in this model -- if the joint-space "
+        "version of this test is passing, _reach_into_other_workspace's goals changed; "
+        "re-sync this test with that one"
+    )
+ 
+    poseL_goal, poseR_goal = robot.arms.forward_kinematics(np.concatenate([qL_goal, qR_goal]))
+ 
+    result = robot.plan_ee_to_pose({"left": poseL_goal, "right": poseR_goal}, seed=0, timeout=30.0)
+    assert result is not None and result.success, (
+        "plan_ee_to_pose failed for a goal pair known reachable via plan_to_configuration -- "
+        "if this is a genuine IK/reachability difference between the two entry points rather "
+        "than a real bug, replace this with a pose pair independently confirmed adversarial "
+        "in EE-pose space"
+    )
+ 
+    n = result.left.num_waypoints
+    assert result.right.num_waypoints == n
+    ts = np.linspace(0.0, result.left.duration, n)
+    colliding_steps = []
+    for i, t in enumerate(ts):
+        qL, _, _ = result.left.sample(t)
+        qR, _, _ = result.right.sample(t)
+        if not _is_pair_collision_free(robot, qL, qR):
+            colliding_steps.append(i)
+ 
+    assert not colliding_steps, (
+        f"plan_ee_to_pose bimanual plan collides at {len(colliding_steps)}/{n} synchronized "
+        f"timesteps despite being derived from a proven-adversarial pair: {colliding_steps[:5]}"
+    )
+
 
 def test_endpoints_are_reached_on_a_clear_goal(robot):
     """A non-adversarial pair (both arms move within their own workspace) should

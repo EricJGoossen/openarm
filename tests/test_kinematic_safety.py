@@ -91,6 +91,31 @@ def _random_goal(rng, lo, hi, margin=0.05):
     span = hi - lo
     return lo + margin * span + rng.random(len(lo)) * span * (1 - 2 * margin)
 
+def _assert_positions_within_limits(traj, lo, hi, margin_rad, label):
+    """Independent position-limit check, mirroring `_assert_within_limits`'
+    treatment of velocity/acceleration but for the retimed/split trajectory's
+    actual joint positions at every waypoint.
+ 
+    `margin_rad` is an ABSOLUTE margin in radians (matching
+    openarm_impedance_control's `joint_position_margin` convention: a fixed
+    0.05 rad on every joint regardless of that joint's total range) -- do not
+    confuse this with `_random_goal`'s `margin` parameter above, which is a
+    FRACTION of each joint's span and is used only for goal generation, not
+    for this check.
+    """
+    lo, hi = np.asarray(lo), np.asarray(hi)
+    pos = traj.positions
+    below = pos < (lo + margin_rad) - REL_TOL
+    above = pos > (hi - margin_rad) + REL_TOL
+    assert not below.any(), (
+        f"{label}: position BELOW the admissible lower limit (with {margin_rad} rad margin) "
+        f"at waypoint(s) {np.where(below.any(axis=1))[0].tolist()[:5]}"
+    )
+    assert not above.any(), (
+        f"{label}: position ABOVE the admissible upper limit (with {margin_rad} rad margin) "
+        f"at waypoint(s) {np.where(above.any(axis=1))[0].tolist()[:5]}"
+    )
+
 
 # ---------------------------------------------------------------------------
 # Single-arm: plan_to_configuration
@@ -206,3 +231,65 @@ class TestCartesianGoalLimits:
         traj = getattr(result, side)
         _assert_within_limits(traj, arm.config.kinematic_limits, f"{side} cartesian delta={delta}")
         _assert_starts_and_ends_at_rest(traj, f"{side} cartesian delta={delta}")
+
+
+# ---------------------------------------------------------------------------
+# Test position limits at every waypoint, not just velocity/acceleration
+# ---------------------------------------------------------------------------
+ 
+
+class TestPositionLimitsAtEveryWaypoint:
+    """Companion to TestSingleArmJointSpaceLimits / TestBimanualJointSpaceLimits:
+    same trajectories, same random seeds, checking `.positions` against joint
+    limits (with the real runtime margin) at every waypoint, instead of
+    `.velocities` / `.accelerations`.
+    """
+ 
+    MARGIN_RAD = 0.05  # matches openarm_impedance_control's joint_position_margin
+ 
+    @pytest.mark.parametrize("side", ["left", "right"])
+    @pytest.mark.parametrize("seed", range(N_RANDOM_SEEDS))
+    def test_single_arm_random_swing_respects_position_limits(self, robot, side, seed):
+        arm = getattr(robot, side).arm
+        lo, hi = arm.get_joint_limits()
+        rng = np.random.default_rng(seed)
+        goal = _random_goal(rng, lo, hi)
+ 
+        result = robot.plan_to_configuration({side: goal}, seed=seed, timeout=15.0)
+        if result is None or not result.success:
+            pytest.skip("planner could not reach this random goal (not a position-limits question)")
+ 
+        traj = getattr(result, side)
+        _assert_positions_within_limits(traj, lo, hi, self.MARGIN_RAD, f"{side} seed={seed}")
+ 
+    @pytest.mark.parametrize("seed", range(N_RANDOM_SEEDS))
+    def test_bimanual_random_goal_respects_position_limits(self, robot, seed):
+        rng = np.random.default_rng(seed)
+        lo_l, hi_l = robot.left.arm.get_joint_limits()
+        lo_r, hi_r = robot.right.arm.get_joint_limits()
+        goal_l = _random_goal(rng, lo_l, hi_l)
+        goal_r = _random_goal(rng, lo_r, hi_r)
+ 
+        result = robot.plan_to_configuration({"left": goal_l, "right": goal_r}, seed=seed, timeout=20.0)
+        if result is None or not result.success:
+            pytest.skip("planner could not reach this random goal pair")
+ 
+        _assert_positions_within_limits(result.left, lo_l, hi_l, self.MARGIN_RAD, f"bimanual left seed={seed}")
+        _assert_positions_within_limits(result.right, lo_r, hi_r, self.MARGIN_RAD, f"bimanual right seed={seed}")
+ 
+    @pytest.mark.parametrize("side", ["left", "right"])
+    @pytest.mark.parametrize(
+        "delta", [[0.05, 0.0, 0.0], [0.0, 0.05, 0.0], [0.0, 0.0, 0.05], [0.05, -0.05, 0.05]]
+    )
+    def test_cartesian_goal_respects_position_limits(self, robot, side, delta):
+        arm = getattr(robot, side).arm
+        lo, hi = arm.get_joint_limits()
+        goal_pose = arm.get_ee_pose().copy()
+        goal_pose[:3, 3] += np.array(delta)
+ 
+        result = robot.plan_ee_to_pose({side: goal_pose}, seed=0)
+        if result is None or not result.success:
+            pytest.skip("planner could not reach this Cartesian goal")
+ 
+        traj = getattr(result, side)
+        _assert_positions_within_limits(traj, lo, hi, self.MARGIN_RAD, f"{side} cartesian delta={delta}")

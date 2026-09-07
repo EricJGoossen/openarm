@@ -164,3 +164,39 @@ class TestAbortDuringExecution:
 
         assert ok is True, "execution did not resume after clear_abort()"
         assert np.allclose(robot.left.arm.get_joint_positions(), goal_l, atol=1e-3)
+
+    def test_mid_execution_abort_leaves_holding_arm_exactly_at_its_start(self, robot, monkeypatch):
+        """Complements test_mid_execution_abort_halts_before_reaching_goal (which
+        tasks -- and only checks -- both arms moving) and
+        test_bimanual_readiness.py::TestHoldingArmStationarity (which proves the
+        *planned* hold trajectory never drifts, at planning time, not through a
+        real abort). Neither existing test would necessarily catch a bug where an
+        abort mid-flight somehow let the held arm's live actuators pick up a
+        stray command (e.g. an indexing bug that fed the moving arm's samples to
+        the held arm) -- this closes that gap directly.
+        """
+        goal_l = robot.left.arm.get_joint_positions().copy()
+        goal_l[0] += 1.0
+    
+        q_right_before = robot.right.arm.get_joint_positions().copy()
+    
+        result = robot.plan_to_configuration({"left": goal_l}, seed=0)
+        assert result is not None and result.success
+        assert result.left.num_waypoints > 10, "trajectory too short to reliably observe a mid-flight abort"
+    
+        calls = {"n": 0}
+    
+        def fake_abort_after_a_few_ticks():
+            calls["n"] += 1
+            return calls["n"] > 5
+    
+        monkeypatch.setattr(robot, "is_abort_requested", fake_abort_after_a_few_ticks)
+    
+        with robot.sim(physics=False, headless=True):
+            ok = robot.execute(result)
+    
+        assert ok is False
+        assert np.array_equal(robot.right.arm.get_joint_positions(), q_right_before), (
+            "the held (untasked) right arm did not end exactly at its starting position after "
+            "a mid-flight abort of the left arm's motion"
+        )
