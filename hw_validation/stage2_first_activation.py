@@ -99,6 +99,7 @@ def one_activation_trial(node, args, trial_index: int) -> TrialOutcome:
     )
 
     recorder = JointStateRecorder(node, joint_filter=args.joints)
+    recorder.start()
     with TelemetrySession(args.log_dir, "stage2_first_activation", label, recorder) as tel:
         pre = recorder.wait_for_joints(args.joints, timeout_s=10.0)
         if pre is None:

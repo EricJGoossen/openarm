@@ -6,6 +6,7 @@ __pycache__/
 build/
 dist/
 certs/
+bringup_logs/
 
 # venv workspace
 .venv/

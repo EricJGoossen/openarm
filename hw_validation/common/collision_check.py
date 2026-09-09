@@ -31,7 +31,16 @@ if TYPE_CHECKING:
 # with `.arm(name).joint_names`, `.set_joint_positions(q)`, and
 # `.check_collisions()`. Passed in rather than imported directly so this
 # module doesn't hard-code a dependency on one specific robot package.
-ArmGroupFactory = Callable[[], ArmGroup]
+#
+# This is a plain module-level assignment, not a function/variable
+# annotation -- `from __future__ import annotations` (top of file) makes
+# annotations lazy, but does NOT affect this expression, so it's evaluated
+# eagerly at import time. ArmGroup is only imported under TYPE_CHECKING
+# (never true at runtime), so referencing it directly here crashed every
+# importer of this module (NameError: name 'ArmGroup' is not defined) --
+# including stage7_bimanual_simultaneous.py and stage8_extended_soak.py,
+# both of which import from here. String forward-reference fixes it.
+ArmGroupFactory = Callable[[], "ArmGroup"]
 
 
 @dataclass
@@ -109,6 +118,22 @@ def check_pair_collision_free(
     q_right = build_joint_matrix(right_samples, right_joint_names, grid)
 
     arm_group = arm_group_factory()
+
+    # TODO(review): clip to each arm's own limits before replaying through
+    # set_joint_positions(), which raises ValueError on any out-of-range
+    # value, no matter how small. Real /joint_states telemetry legitimately
+    # reports joint4 fractionally below its own 0.0 lower limit sometimes
+    # (real backlash/sensor noise at that joint specifically -- the same
+    # thing Stage 5's confirm_recovery() already has to np.clip() around),
+    # and resampling onto a shared time grid (_resample()'s np.interp) can
+    # itself introduce a similar hair's-width overshoot. This is a pure
+    # offline replay for collision-checking already-recorded telemetry --
+    # it never commands real hardware -- so clamping here just keeps a
+    # meaningless sub-mm-scale noise artifact from crashing the analysis.
+    left_lower, left_upper = arm_group[left_key].get_joint_limits()
+    right_lower, right_upper = arm_group[right_key].get_joint_limits()
+    q_left = np.clip(q_left, left_lower, left_upper)
+    q_right = np.clip(q_right, right_lower, right_upper)
 
     violations: list[float] = []
     details: list[str] = []

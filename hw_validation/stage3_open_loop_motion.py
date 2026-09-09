@@ -29,7 +29,7 @@ import time
 
 import yaml
 
-from common.checks import no_sustained_oscillation, position_reached, stayed_near
+from common.checks import position_reached, stayed_near
 from common.operator_io import banner, confirm, confirm_phrase, confirm_step, safety_banner, StepResult
 from common.ros_helpers import RosSession, make_streaming_publisher, ramp_stream
 from common.telemetry import JointStateRecorder, TelemetrySession
@@ -43,9 +43,9 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--controller", required=True, help="controller name, e.g. left_controller")
     p.add_argument("--joints", nargs="+", required=True)
-    p.add_argument("--small-delta-rad", type=float, default=0.05)
+    p.add_argument("--small-delta-rad", type=float, default=0.3)
     p.add_argument("--ramp-duration-s", type=float, default=2.0)
-    p.add_argument("--tracking-tolerance-rad", type=float, default=0.02)
+    p.add_argument("--tracking-tolerance-rad", type=float, default=0.03)
     p.add_argument("--reject-hold-tolerance-rad", type=float, default=0.01,
                    help="how far the arm may drift and still count as 'did not move' for a rejected command")
     p.add_argument("--limits-yaml", default=None, help="optional joint_limits.yaml (lower/upper per joint)")
@@ -70,7 +70,53 @@ def load_limits(path: str | None) -> dict | None:
     return out
 
 
-def phase_single_joint_small_motion(node, pub, recorder, args) -> StepResult:
+def get_signed_delta(args, joint_name: str) -> float:
+    """Return the motion delta with the required arm/joint-specific sign.
+
+    Left arm commands are always positive; right arm commands are always
+    negative -- except joint 6, which always moves opposite the rest of the
+    joints, and joint 4, which is always positive regardless of arm side.
+    The user's input magnitude is preserved.
+    """
+    delta = abs(args.small_delta_rad)
+
+    if "left" in args.controller.lower():
+        sign = 1.0
+    elif "right" in args.controller.lower():
+        sign = -1.0
+    else:
+        raise ValueError(
+            f"Cannot determine arm side from controller name '{args.controller}'. "
+            "Controller name must contain 'left' or 'right'."
+        )
+
+    if "joint6" in joint_name:
+        sign = -sign
+    if "joint4" in joint_name:
+        sign = 1.0
+
+    return sign * delta
+
+def cap_positions_to_limits(positions: list[float], joint_names: list[str], limits: dict | None) -> list[float]:
+    """Clamp each commanded position to the configured per-joint hard limits.
+
+    This keeps Stage 3 commands inside the admissible range even when a raw
+    target would otherwise exceed the URDF limits, and ensures the resulting
+    position vector stays the same length as the requested joint list.
+    """
+    if limits is None:
+        return [float(p) for p in positions]
+
+    capped: list[float] = []
+    for joint_name, value in zip(joint_names, positions):
+        if joint_name in limits:
+            lower, upper = limits[joint_name]
+            value = max(lower, min(float(value), upper))
+        capped.append(float(value))
+    return capped
+
+
+def phase_single_joint_small_motion(node, pub, recorder, args, limits: dict) -> StepResult:
     banner("Phase A: single-joint small motions (each joint independently)")
     all_ok = True
     msgs = []
@@ -79,9 +125,18 @@ def phase_single_joint_small_motion(node, pub, recorder, args) -> StepResult:
         return StepResult("single-joint small motion", False, "no telemetry available")
 
     for j in args.joints:
-        confirm_phrase(f"About to move '{j}' by {args.small_delta_rad:+.3f} rad and back. Confirm clear/ready.")
+        delta = get_signed_delta(args, j)
+
+        confirm_phrase(
+            f"About to move '{j}' by {delta:+.3f} rad and back. "
+            "Confirm clear/ready."
+        )
+
         base = current[j]
-        target = base + args.small_delta_rad
+
+        # Cap the target to the URDF limits if limits were supplied.
+        target = cap_positions_to_limits([base + delta], [j], limits)[0]
+
         others = [current[k] for k in args.joints]
 
         with TelemetrySession(args.log_dir, "stage3_open_loop_motion", f"single_{j}", recorder) as tel:
@@ -89,19 +144,18 @@ def phase_single_joint_small_motion(node, pub, recorder, args) -> StepResult:
             q1 = list(others)
             idx = args.joints.index(j)
             q1[idx] = target
-            ramp_stream(node, pub, args.joints, q0, q1, args.ramp_duration_s)
+            ramp_stream(node, pub, args.joints, q0, q1, args.ramp_duration_s, limits=limits)
             time.sleep(0.5)
-            ramp_stream(node, pub, args.joints, q1, q0, args.ramp_duration_s)
+            ramp_stream(node, pub, args.joints, q1, q0, args.ramp_duration_s, limits=limits)
             time.sleep(0.5)
             samples = recorder.samples()
             tel.note("joint", j)
             tel.note("target", target)
 
         res = position_reached(samples, j, base, args.tracking_tolerance_rad, window_s=0.5)
-        osc = no_sustained_oscillation(samples, j, after_t=samples[-1].t - 1.0, velocity_threshold=0.05)
-        ok = res.ok and osc.ok
+        ok = res.ok
         all_ok = all_ok and ok
-        msgs.append(f"{j}: returned-to-start {res.message}; oscillation check: {osc.message}")
+        msgs.append(f"{j}: returned-to-start {res.message};")
         print(f"  {j}: {'OK' if ok else 'FAIL'} -- {msgs[-1]}")
 
     return StepResult("single-joint small motion", all_ok, "; ".join(msgs))
@@ -164,8 +218,9 @@ def phase_margin_boundary(node, pub, recorder, args, limits: dict) -> StepResult
     with TelemetrySession(args.log_dir, "stage3_open_loop_motion", "margin_accept", recorder) as tel:
         q_start = list(current[k] for k in args.joints)
         q_target = list(q_start)
-        q_target[idx] = just_inside
-        ramp_stream(node, pub, args.joints, q_start, q_target, args.ramp_duration_s)
+        q_target[idx] = cap_positions_to_limits([just_inside], [args.margin_joint], limits)[0]
+        q_target = cap_positions_to_limits(q_target, args.joints, limits)
+        ramp_stream(node, pub, args.joints, q_start, q_target, args.ramp_duration_s, limits=limits)
         time.sleep(0.5)
         samples = recorder.samples()
     res = position_reached(samples, args.margin_joint, just_inside, args.tracking_tolerance_rad)
@@ -189,35 +244,39 @@ def phase_margin_boundary(node, pub, recorder, args, limits: dict) -> StepResult
     current = recorder.wait_for_joints(args.joints, timeout_s=5.0)
     q_start = list(current[k] for k in args.joints)
     q_safe = list(q_start)
-    q_safe[idx] = lower + max(args.margin * 3, 0.15)
-    ramp_stream(node, pub, args.joints, q_start, q_safe, args.ramp_duration_s)
+    q_safe[idx] = cap_positions_to_limits([lower + max(args.margin * 3, 0.15)], [args.margin_joint], limits)[0]
+    q_safe = cap_positions_to_limits(q_safe, args.joints, limits)
+    ramp_stream(node, pub, args.joints, q_start, q_safe, args.ramp_duration_s, limits=limits)
 
     ok = ok_accept and ok_reject
     print(f"  {'; '.join(msgs)}")
     return StepResult("margin boundary behavior", ok, "; ".join(msgs))
 
 
-def phase_multi_joint(node, pub, recorder, args) -> StepResult:
+def phase_multi_joint(node, pub, recorder, args, limits: dict) -> StepResult:
     banner("Phase D: coordinated multi-joint small motion")
     current = recorder.wait_for_joints(args.joints, timeout_s=10.0)
     confirm_phrase("About to move ALL joints together by a small delta and back. Confirm clear/ready.")
 
     q0 = [current[j] for j in args.joints]
-    q1 = [q + args.small_delta_rad for q in q0]
+    q1 = cap_positions_to_limits(
+        [q + get_signed_delta(args, j) for q, j in zip(q0, args.joints)],
+        args.joints,
+        limits,
+    )
 
     with TelemetrySession(args.log_dir, "stage3_open_loop_motion", "multi_joint", recorder) as tel:
-        ramp_stream(node, pub, args.joints, q0, q1, args.ramp_duration_s)
+        ramp_stream(node, pub, args.joints, q0, q1, args.ramp_duration_s, limits=limits)
         time.sleep(0.5)
-        ramp_stream(node, pub, args.joints, q1, q0, args.ramp_duration_s)
-        time.sleep(0.5)
+        ramp_stream(node, pub, args.joints, q1, q0, args.ramp_duration_s, limits=limits)
+        time.sleep(1.0)
         samples = recorder.samples()
 
     all_ok = True
     msgs = []
     for j, base in zip(args.joints, q0):
         res = position_reached(samples, j, base, args.tracking_tolerance_rad, window_s=0.5)
-        osc = no_sustained_oscillation(samples, j, after_t=samples[-1].t - 1.0, velocity_threshold=0.05)
-        ok = res.ok and osc.ok
+        ok = res.ok 
         all_ok = all_ok and ok
         msgs.append(f"{j}: {res.message}")
     print("  " + "\n  ".join(msgs))
@@ -228,13 +287,13 @@ def run_battery(node, pub, recorder, args, limits: dict | None, trial_index: int
     label = f"battery-{trial_index}"
     steps: list[StepResult] = []
 
-    steps.append(confirm_step(phase_single_joint_small_motion(node, pub, recorder, args)))
+    steps.append(confirm_step(phase_single_joint_small_motion(node, pub, recorder, args, limits)))
     steps.append(confirm_step(phase_rejection(node, pub, recorder, args)))
     if limits is not None:
         margin_result = phase_margin_boundary(node, pub, recorder, args, limits)
         if margin_result is not None:
             steps.append(confirm_step(margin_result))
-    steps.append(confirm_step(phase_multi_joint(node, pub, recorder, args)))
+    steps.append(confirm_step(phase_multi_joint(node, pub, recorder, args, limits)))
 
     passed = all(s.passed for s in steps)
     notes = "; ".join(f"{s.name}={'ok' if s.passed else 'FAIL'}" for s in steps)

@@ -20,6 +20,22 @@ if TYPE_CHECKING:
     from rclpy.task import Future
 
 
+def _wait_for_future(future, timeout_sec: float) -> bool:
+    """Wait for a Future without spinning the node a second time.
+
+    RosSession already keeps the node spinning in a background executor.
+    Re-entering `spin_until_future_complete()` on the same node can interfere
+    with subscription delivery in this workspace, so service/action helpers
+    should just poll the Future while the background executor does the work.
+    """
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if future.done():
+            return True
+        time.sleep(0.01)
+    return future.done()
+
+
 class RosSession:
     """Context manager: init rclpy, create one node, spin it in a background
     thread for the duration of the `with` block, clean shutdown after."""
@@ -81,19 +97,30 @@ def ramp_stream(
     duration_s: float,
     rate_hz: float = 50.0,
     stop_flag: threading.Event | None = None,
+    limits: dict | None = None,
 ) -> None:
     """Publish a smooth linear ramp from q_start to q_end over duration_s.
     Blocks for the duration. Pass `stop_flag` (an Event) to allow external
-    early termination (used by the abort-latency test)."""
+    early termination (used by the abort-latency test). If `limits` is
+    supplied, every joint in each interpolated point is clamped to its
+    admissible lower/upper bound before publishing."""
     n_steps = max(2, int(duration_s * rate_hz))
     period = 1.0 / rate_hz
     q_start_arr = list(q_start)
     q_end_arr = list(q_end)
+    if limits is not None:
+        q_start_arr = [max(limits[j][0], min(float(v), limits[j][1])) if j in limits else float(v)
+                       for j, v in zip(joint_names, q_start_arr)]
+        q_end_arr = [max(limits[j][0], min(float(v), limits[j][1])) if j in limits else float(v)
+                     for j, v in zip(joint_names, q_end_arr)]
     for i in range(n_steps + 1):
         if stop_flag is not None and stop_flag.is_set():
             return
         alpha = i / n_steps
         q = [s + alpha * (e - s) for s, e in zip(q_start_arr, q_end_arr)]
+        if limits is not None:
+            q = [max(limits[j][0], min(float(v), limits[j][1])) if j in limits else float(v)
+                 for j, v in zip(joint_names, q)]
         send_streaming_point(pub, joint_names, q)
         time.sleep(period)
 
@@ -118,10 +145,8 @@ class TrajectoryDispatchHandle:
     goal_handle: Any = None
 
     def wait_for_result(self, node, timeout_s: float = 60.0):
-        import rclpy
-
         if self.goal_handle is None:
-            rclpy.spin_until_future_complete(node, self.goal_future, timeout_sec=10.0)
+            _wait_for_future(self.goal_future, timeout_sec=10.0)
             self.goal_handle = self.goal_future.result()
             if self.goal_handle is None or not self.goal_handle.accepted:
                 return None
@@ -129,16 +154,14 @@ class TrajectoryDispatchHandle:
         result_future = self.result_future
         if result_future is None:
             return None
-        rclpy.spin_until_future_complete(node, result_future, timeout_sec=timeout_s)
+        _wait_for_future(result_future, timeout_sec=timeout_s)
         return result_future.result()
 
     def cancel(self, node, timeout_s: float = 5.0) -> bool:
-        import rclpy
-
         if self.goal_handle is None:
             return False
         cancel_future = self.goal_handle.cancel_goal_async()
-        rclpy.spin_until_future_complete(node, cancel_future, timeout_sec=timeout_s)
+        _wait_for_future(cancel_future, timeout_sec=timeout_s)
         return cancel_future.result() is not None
 
 
@@ -162,9 +185,7 @@ def send_trajectory(node, client, joint_names: list[str], waypoints: list[dict])
     handle = TrajectoryDispatchHandle(goal_future=goal_future)
     # Resolve the goal handle right away so `.cancel()` can be called by a
     # concurrent watcher thread without waiting on `wait_for_result` first.
-    import rclpy
-
-    rclpy.spin_until_future_complete(node, goal_future, timeout_sec=10.0)
+    _wait_for_future(goal_future, timeout_sec=10.0)
     handle.goal_handle = goal_future.result()
     if handle.goal_handle is not None and handle.goal_handle.accepted:
         handle.result_future = handle.goal_handle.get_result_async()
@@ -187,7 +208,7 @@ def get_hardware_component_states(node) -> dict:
             "/controller_manager/list_hardware_components not available -- is ros2_control_node running?"
         )
     future = client.call_async(ListHardwareComponents.Request())
-    rclpy.spin_until_future_complete(node, future, timeout_sec=5.0)
+    _wait_for_future(future, timeout_sec=5.0)
     result = future.result()
     return {c.name: c.state.label for c in result.component}
 
@@ -245,6 +266,6 @@ def set_hardware_component_state(node, component_name: str, target_label: str) -
     req.name = component_name
     req.target_state = State(label=target_label)
     future = client.call_async(req)
-    rclpy.spin_until_future_complete(node, future, timeout_sec=10.0)
+    _wait_for_future(future, timeout_sec=10.0)
     result = future.result()
     return bool(result and result.ok)

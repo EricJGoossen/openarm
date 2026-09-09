@@ -51,7 +51,15 @@ class OpenarmRealContext:
         self._robot = robot
 
     def __enter__(self):
-        self._shadow.__enter__()   # registers controller on the event loop
+        # TODO(review): locked for the same reason as execute()/step()/
+        # step_cartesian() below -- see Openarm._sim_step_lock's follow-up
+        # note. SimContext.__enter__() calls mujoco.mj_forward() (via
+        # sync()) directly when headless (no PhysicsEventLoop configured,
+        # which is the case for hw_validation), so two threads entering
+        # robot.real() at nearly the same instant raced on it and segfaulted
+        # -- the original execute()-only lock didn't cover context entry.
+        with self._robot._sim_step_lock:
+            self._shadow.__enter__()   # registers controller on the event loop
         self._hw.__enter__()       # connects ROS 2, waits for action servers
         self._robot._active_context = self
         return self
@@ -59,20 +67,45 @@ class OpenarmRealContext:
     def __exit__(self, *args):
         self._robot._active_context = None
         hw_ok = self._hw.__exit__(*args)
-        shadow_ok = self._shadow.__exit__(*args)
+        # TODO(review): same lock as __enter__() above -- SimContext.__exit__()
+        # also touches shared model/data (clearing the controller, closing
+        # any viewer) and needs the same serialization.
+        with self._robot._sim_step_lock:
+            shadow_ok = self._shadow.__exit__(*args)
         return hw_ok and shadow_ok
 
     def step_cartesian(self, arm_name, position, velocity=None):
-        self._shadow.step_cartesian(arm_name, position, velocity)  # local viewer/collision
+        # TODO(review): Locked: see Openarm._sim_step_lock -- self._shadow
+        # wraps the ONE shared model/data every robot.real()/robot.sim()
+        # call uses, and MuJoCo's C API isn't safe for concurrent mutation
+        # of it from multiple threads (e.g. two threads each holding their
+        # own real() context for a different arm).
+        with self._robot._sim_step_lock:
+            self._shadow.step_cartesian(arm_name, position, velocity)  # local viewer/collision
         self._hw.step_cartesian(arm_name, position, velocity)      # real motors
 
     def step(self, targets=None):
-        self._shadow.step(targets)
+        # TODO(review): same Openarm._sim_step_lock fix as execute() above.
+        with self._robot._sim_step_lock:
+            self._shadow.step(targets)
         self._hw.step(targets)
 
     def execute(self, item):
-        self._shadow.execute(item)
-        return self._hw.execute(item)
+        # TODO(review): Only the shadow mutation needs the lock --
+        # self._hw.execute() (real ROS 2 dispatch, separate action clients
+        # per arm) is left unlocked so two arms genuinely can execute
+        # concurrently on real hardware, which is the actual point of
+        # tests like Stage 6 hw_validation's phase_concurrent_independent.
+        # See Openarm._sim_step_lock for the full crash writeup.
+        with self._robot._sim_step_lock:
+            self._shadow.execute(item)
+        # HardwareContext._execute_single() polls abort_fn() during
+        # execution and cancels the in-flight goal when it returns True --
+        # but only if it's actually passed one. Without this, a mid-flight
+        # request_abort() has no effect on real hardware at all (Stage 5
+        # bring-up: execute() kept returning True, trajectory ran to
+        # completion, motion "never settled" because it was never stopped).
+        return self._hw.execute(item, abort_fn=self._robot.is_abort_requested)
 
     def sync(self):
         self._shadow.sync()
@@ -154,10 +187,10 @@ class _ArmScope:
         return self._robot.plan_ee_to_pose({self._name: target})
 
     def plan_to_configuration(
-        self, target: list[np.ndarray],
+        self, target: list[np.ndarray], *, max_seed_retry_attempts: int = 10
     ) -> PlanGroupResult | None:
         """Plan a trajectory for the arms to reach the target joint configurations."""
-        return self._robot.plan_to_configuration({self._name: target})
+        return self._robot.plan_to_configuration({self._name: target}, max_seed_retry_attempts=max_seed_retry_attempts)
 
     def plan_to_tsrs(
         self, target: list[np.ndarray],
@@ -288,6 +321,43 @@ class Openarm:
 
         self._abort_event = threading.Event()
 
+        # TODO(review): Guards the shadow SimContext's mutation of
+        # self.model/self.data (qpos writes + mujoco.mj_forward calls) --
+        # MuJoCo's C API is not thread-safe for concurrent calls on the same
+        # mjData. Every robot.real()/robot.sim() call constructs a *new*
+        # SimContext, but all of them wrap this SAME shared model/data, so
+        # two threads each doing `with robot.real() as ctx:
+        # robot.execute(...)` (e.g. Stage 6 hw_validation's
+        # phase_concurrent_independent, which dispatches two independent
+        # single-arm executions on two threads) can call mj_forward on the
+        # same mjData concurrently -- CONFIRMED TO SEGFAULT THE PROCESS ON
+        # REAL HARDWARE (reproduced during Stage 6 bring-up). Fixed by
+        # serializing shadow mutation only (real ROS 2 dispatch via
+        # self._hw stays unlocked/concurrent) -- see
+        # OpenarmRealContext.execute()/step()/step_cartesian(). Please
+        # review this fix -- it's a reasonable minimal patch but the
+        # underlying shared-mjData-across-threads design in
+        # OpenarmRealContext/SimContext may be worth a closer look/more
+        # permanent fix upstream in mj_manipulator.
+        #
+        # TODO(review), follow-up: the original fix above only covered
+        # execute()/step()/step_cartesian() and still segfaulted on a later
+        # Stage 6 run -- turned out entering/exiting the context matters too.
+        # SimContext.__enter__() calls _setup_physics()/_setup_kinematic()
+        # (builds a fresh PhysicsController/KinematicController against
+        # self._model/self._data) and then self.sync(), which calls
+        # mujoco.mj_forward() directly whenever no PhysicsEventLoop is
+        # configured -- true here, since headless hw_validation runs don't
+        # set one up (that machinery is for the interactive viewer). Without
+        # an event loop serializing access, sync() has no protection of its
+        # own, so two threads' `with robot.real():` blocks entering at
+        # nearly the same instant (phase_concurrent_independent starts both
+        # threads back-to-back with no handoff) raced on mj_forward the same
+        # way execute() used to. Now also locking
+        # OpenarmRealContext.__enter__()/__exit__(), not just the three
+        # methods above.
+        self._sim_step_lock = threading.Lock()
+
     def _create_arm(self, spec: OpenarmArmSpec, name: str) -> Arm:
         """Create an mj_manipulator Arm from a OpenarmArmSpec."""
         joint_names = self.config.joint_names(spec)
@@ -400,7 +470,7 @@ class Openarm:
                 run_teleop(rig, config)
         """
         from mj_manipulator_ros.hardware_context import HardwareContext
-        
+
         shadow = SimContext(
             self.model,
             self.data,
@@ -411,7 +481,7 @@ class Openarm:
             event_loop=event_loop,
             physics_config=self.config.physics_config,
         )
-        hw = HardwareContext(self.config.to_hardware_config(), node_name=self.config.physics_config.node_name)
+        hw = HardwareContext(self.config.to_hardware_config())
         return OpenarmRealContext(hw, shadow, self)
 
     def __getattr__(self, name: str) -> Any:
@@ -454,7 +524,7 @@ class Openarm:
     # Path planning
     # -----------------------------------------------------------------
 
-    def _package_plan(self, path: list[np.ndarray] | None):
+    def _package_plan(self, path: list[np.ndarray] | None) -> PlanGroupResult | None:
         """Retime a raw geometric path and split it into per-arm trajectories.
 
         Each plan_* method below only needs to produce the raw combined
@@ -478,23 +548,49 @@ class Openarm:
         split = combined.split_trajectory(self._arm_group)
         return PlanGroupResult.from_trajectories(split)
 
-    def plan_to_configuration(self, goal, **kwargs):
-        """Plan a trajectory for the arms to reach the target joint configurations."""
-        return self._package_plan(self._arm_group.plan_to_configuration(goal, **kwargs))
+    def _plan_with_seed_retry(self, plan_fn, goal, *, max_seed_retry_attempts: int = 10, **kwargs):
+        """Call plan_fn(goal, **kwargs) and package the result, retrying with
+        nearby seeds if the geometric path it finds can't be retimed cleanly.
 
-    def plan_ee_to_pose(self, goal, **kwargs):
+        A CBiRRT path that just grazes an obstacle can be too close for
+        retime()'s densify-and-retry to recover (see _package_plan) even
+        though the goal pair has a genuinely collision-free solution --
+        different seeds explore different trees and routinely avoid the
+        graze entirely. Bounded by max_seed_retry_attempts so a truly
+        infeasible goal still fails fast.
+        """
+        seed = kwargs.pop("seed", None)
+        base_seed = 0 if seed is None else seed
+        result = None
+        for attempt in range(max_seed_retry_attempts):
+            result = self._package_plan(plan_fn(goal, seed=base_seed + attempt, **kwargs))
+            if result is not None and result.success:
+                return result
+        return result
+
+    def plan_to_configuration(self, goal, *, max_seed_retry_attempts: int = 10, **kwargs):
+        """Plan a trajectory for the arms to reach the target joint configurations."""
+        return self._plan_with_seed_retry(
+            self._arm_group.plan_to_configuration, goal, max_seed_retry_attempts=max_seed_retry_attempts, **kwargs
+        )
+
+    def plan_ee_to_pose(self, goal, *, max_seed_retry_attempts: int = 10, **kwargs):
         """Plan a trajectory for the end effectors to reach the target poses.
- 
+
         Note: translates to ArmGroup.plan_to_poses at the boundary -- the
         naming differs deliberately (openarm's public API is end-effector-
         pose-focused; ArmGroup's is the generic mj_manipulator name), not
         by oversight. See item C.6.
         """
-        return self._package_plan(self._arm_group.plan_to_poses(goal, **kwargs))
+        return self._plan_with_seed_retry(
+            self._arm_group.plan_to_poses, goal, max_seed_retry_attempts=max_seed_retry_attempts, **kwargs
+        )
 
-    def plan_to_tsrs(self, goal, **kwargs):
+    def plan_to_tsrs(self, goal, *, max_seed_retry_attempts: int = 10, **kwargs):
         """Plan a trajectory for the arms to reach the target TSRs."""
-        return self._package_plan(self._arm_group.plan_to_tsrs(goal, **kwargs))
+        return self._plan_with_seed_retry(
+            self._arm_group.plan_to_tsrs, goal, max_seed_retry_attempts=max_seed_retry_attempts, **kwargs
+        )
 
     def plan_reach_to_pose(
         self,

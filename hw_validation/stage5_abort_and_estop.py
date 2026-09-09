@@ -37,15 +37,17 @@ import argparse
 import threading
 import time
 
+import mujoco
 import numpy as np
 
-from common.checks import settle_time_after
+from common.checks import position_reached, settle_time_after
+from common.hardware_sync import sync_shadow_from_hardware
 from common.operator_io import banner, confirm, confirm_phrase, confirm_step, safety_banner, StepResult
 from common.telemetry import JointStateRecorder, TelemetrySession
 from common.trial_runner import TrialOutcome, run_repeated_trials
 
 TRIGGER_POINTS = ("early", "middle", "late")
-FRACTIONS = {"early": 0.15, "middle": 0.5, "late": 0.85}
+FRACTIONS = {"early": 0.3, "middle": 0.5, "late": 0.85}
 
 
 def parse_args():
@@ -54,9 +56,29 @@ def parse_args():
     p.add_argument("--arm", required=True, choices=["left", "right"])
     p.add_argument("--repeats-per-point", type=int, default=5, help="spec minimum: 5 per trigger point per arm")
     p.add_argument("--goal-delta-rad", type=float, default=1.0, help="a long-enough motion to observe mid-flight")
-    p.add_argument("--velocity-settle-threshold", type=float, default=0.02)
+    p.add_argument(
+        "--velocity-settle-threshold", type=float, default=0.08,
+        help="reported /joint_states velocity is quantized/noisy even at true zero motion -- inspected "
+        "recorded telemetry from a real abort where position was bit-exact frozen for ~1s straight, "
+        "and reported |velocity| still oscillated up to ~0.055 rad/s the whole time. 0.08 clears that "
+        "noise floor with margin; 0.02 (the old default) is tighter than the noise itself, so "
+        "settle_time_after() could never find a qualifying window regardless of real motion.",
+    )
+    p.add_argument(
+        "--post-abort-settle-s", type=float, default=1.5,
+        help="extra recording time after execute() returns (i.e. after the goal is cancelled/stopped) "
+        "before checking settle -- execute() returning only means the goal ended, not that the arm has "
+        "physically finished decelerating, and settle_time_after() needs sustain_s of post-stop data "
+        "to confirm a settle at all.",
+    )
     p.add_argument("--sim-baseline-latency-s", type=float, default=None,
                    help="optional Stage-0 simulated abort latency for this mechanism, for comparison")
+    p.add_argument(
+        "--recovery-check-delta-rad", type=float, default=0.2,
+        help="size of the real test motion confirm_recovery() commands after clear_abort() to verify "
+        "the arm is actually holdable/commandable again, instead of just asking the operator.",
+    )
+    p.add_argument("--recovery-check-tolerance-rad", type=float, default=0.03)
     p.add_argument("--log-dir", default="bringup_logs")
     return p.parse_args()
 
@@ -69,28 +91,122 @@ def build_robot():
 
 
 def long_goal(robot, arm: str, delta: float) -> np.ndarray:
-    current = getattr(robot, arm).arm.get_joint_positions().copy()
+    arm_scope = getattr(robot, arm).arm
+    current = arm_scope.get_joint_positions().copy()
     offset = np.zeros_like(current)
     offset[0] = delta  # a single large-ish joint move is enough to give a long, observable trajectory
-    return current + offset
+    goal = current + offset
+    # Defensive clamp (see stage4_trajectory_execution.py's make_goal()) --
+    # with sync_shadow_from_hardware()/return_to_zero() below keeping
+    # `current` accurate and near a known safe pose, this shouldn't bind in
+    # practice, but costs nothing to guarantee.
+    lower, upper = arm_scope.get_joint_limits()
+    return np.clip(goal, lower, upper)
 
 
-def confirm_recovery(robot) -> StepResult:
+def return_to_zero(robot, arm: str, other_arm: str, sync_recorder: JointStateRecorder) -> None:
+    """Plan and execute a return to the zero configuration between trials.
+
+    Not just an operator convenience here (contrast
+    stage4_trajectory_execution.py's version of this): long_goal() computes
+    each trial's target as current + delta, and an abort can leave the real
+    arm at any unpredictable point along the trajectory (early/middle/late
+    triggers, plus whatever the operator's physical-mode press timing
+    actually lands on). Without resetting to a known position between
+    trials, repeated trials could walk the joint cumulatively toward its
+    limit rather than each starting fresh. robot.reset() alone does NOT do
+    this -- see common/hardware_sync.py.
+
+    Re-syncs `other_arm` immediately before planning even though trial()
+    already synced both arms at the top -- software_trial()/physical_trial()
+    run for several real seconds (execute, wait-for-trigger, settle,
+    operator prompts) in between, long enough for that initial sync to go
+    stale and get the untested arm nudged by a "hold at stale shadow"
+    trajectory (observed: right arm moving slightly during left-arm trials).
+    """
+    sync_shadow_from_hardware(robot, other_arm, sync_recorder)
+    joint_names = list(getattr(robot, arm).arm.config.joint_names)
+    zero = np.zeros(len(joint_names))
+    confirm_phrase(
+        f"About to return the '{arm}' arm to zero before the next trial. Confirm workspace clear.",
+    )
+    result = robot.plan_to_configuration({arm: zero}, seed=0)
+    if result is None or not getattr(result, "success", False):
+        print(f"  (couldn't plan a return-to-zero for '{arm}' -- skipping; next trial syncs from wherever it is)")
+        return
+    with robot.real() as ctx:  # noqa: F841
+        robot.execute(result)
+
+
+def confirm_recovery(
+    robot, arm: str, joint_names: list[str], args, other_arm: str, sync_recorder: JointStateRecorder
+) -> StepResult:
+    """Clear the abort, then actually command a small real motion and
+    verify it via telemetry -- rather than just asking the operator whether
+    the arm 'looks' recovered, prove it's genuinely holdable/commandable by
+    driving it a known small distance and checking it got there.
+
+    Re-syncs `other_arm` first -- see return_to_zero()'s docstring for why
+    the sync at the top of trial() isn't enough by the time this runs.
+    """
+    sync_shadow_from_hardware(robot, other_arm, sync_recorder)
     robot.clear_abort()
     still_aborted = robot.is_abort_requested()
     print(f"\nis_abort_requested() after clear_abort(): {still_aborted} (expected False)")
+
+    recorder = JointStateRecorder(_shared_node, joint_filter=joint_names)
+    recorder.start()
+    real = recorder.wait_for_joints(joint_names, timeout_s=5.0)
+    motion_ok = False
+    if real is None:
+        motion_msg = "recovery-check motion not attempted -- couldn't read real joint state"
+    else:
+        arm_scope = getattr(robot, arm).arm
+        for name, idx in zip(joint_names, arm_scope.joint_qpos_indices):
+            robot.data.qpos[idx] = real[name]
+        mujoco.mj_forward(robot.model, robot.data)
+
+        lower, upper = arm_scope.get_joint_limits()
+        goal = np.array([real[n] for n in joint_names])
+        goal[0] = goal[0] + args.recovery_check_delta_rad
+        # Every joint's target here defaults to wherever the arm actually
+        # is right now -- including joints we're not deliberately moving.
+        # joint4 in particular keeps drifting a hair past its own 0.0 lower
+        # limit at rest (seen -0.0002 to -0.0105 across this session); left
+        # unclamped, reproducing that as its own "target" gets this whole
+        # plan rejected by _config_candidates depending on which side of
+        # zero the noise happens to land on that trial.
+        goal = np.clip(goal, lower, upper)
+
+        result = robot.plan_to_configuration({arm: goal}, seed=0)
+        if result is None or not getattr(result, "success", False):
+            motion_msg = "recovery-check motion failed to plan -- treat recovery as NOT verified"
+        else:
+            with robot.real() as ctx:  # noqa: F841
+                exec_ok = robot.execute(result)
+            time.sleep(1.0)  # let it actually get there and settle before checking
+            samples = recorder.samples()
+            res = position_reached(samples, joint_names[0], float(goal[0]), args.recovery_check_tolerance_rad)
+            motion_ok = exec_ok and res.ok
+            motion_msg = f"recovery-check motion: execute()={exec_ok}, {res.message}"
+
+    print(f"  {motion_msg}")
     operator_recovered = confirm(
-        "Per your documented recovery procedure: has the arm returned to normal, holdable, "
-        "commandable operation (no stale fault, no unexpected residual motion)?",
+        f"Automated check: {motion_msg}\nDid that recovery-check motion also look normal to you "
+        "(moved smoothly, correct direction, no fault)?",
         default=False,
     )
+    passed = (not still_aborted) and motion_ok and operator_recovered
     return StepResult(
-        "recovery after stop", (not still_aborted) and operator_recovered,
-        f"abort flag cleared={not still_aborted}",
+        "recovery after stop", passed,
+        f"abort flag cleared={not still_aborted}; {motion_msg}",
     )
 
 
-def software_trial(robot, arm: str, joint_names: list[str], args, trigger_point: str, trial_index: int) -> TrialOutcome:
+def software_trial(
+    robot, arm: str, joint_names: list[str], args, trigger_point: str, trial_index: int,
+    other_arm: str, sync_recorder: JointStateRecorder,
+) -> TrialOutcome:
     label = f"software-{trigger_point}-{trial_index}"
     goal = long_goal(robot, arm, args.goal_delta_rad)
 
@@ -99,7 +215,6 @@ def software_trial(robot, arm: str, joint_names: list[str], args, trigger_point:
         f"'{trigger_point}' point ({FRACTIONS[trigger_point]*100:.0f}% through). Confirm clear/ready."
     )
 
-    robot.reset()
     robot.clear_abort()
     result = robot.plan_to_configuration({arm: goal}, seed=trial_index)
     if result is None or not getattr(result, "success", False):
@@ -128,6 +243,16 @@ def software_trial(robot, arm: str, joint_names: list[str], args, trigger_point:
 
         thread.join(timeout=planned_duration + 15.0)
         t_thread_done = time.time()
+        # execute() returning just means the goal was cancelled -- it says
+        # nothing about whether the arm has physically stopped decelerating
+        # yet. settle_time_after() needs sustain_s (0.15s default) of
+        # continuous low-velocity data *after* the settle point to confirm
+        # it, so without waiting here the recording can end right as the
+        # arm is still coasting to a stop, and a genuinely-fine abort gets
+        # reported as "never settled" for lack of post-abort data, not
+        # because anything was actually wrong.
+        if args.post_abort_settle_s > 0:
+            time.sleep(args.post_abort_settle_s)
         samples = recorder.samples()
         tel.note("t_abort_request", t_abort)
         tel.note("planned_duration_s", planned_duration)
@@ -164,13 +289,16 @@ def software_trial(robot, arm: str, joint_names: list[str], args, trigger_point:
         question="Did the arm actually stop promptly and safely when the abort was issued -- not "
         "continue to the original goal, and not move violently?",
     )
-    recovery = confirm_step(confirm_recovery(robot))
+    recovery = confirm_step(confirm_recovery(robot, arm, joint_names, args, other_arm, sync_recorder))
 
     passed = step.passed and recovery.passed
     return TrialOutcome(passed, label, latency_msg)
 
 
-def physical_trial(robot, arm: str, joint_names: list[str], args, trigger_point: str, trial_index: int) -> TrialOutcome:
+def physical_trial(
+    robot, arm: str, joint_names: list[str], args, trigger_point: str, trial_index: int,
+    other_arm: str, sync_recorder: JointStateRecorder,
+) -> TrialOutcome:
     label = f"physical-{trigger_point}-{trial_index}"
     goal = long_goal(robot, arm, args.goal_delta_rad)
 
@@ -180,7 +308,6 @@ def physical_trial(robot, arm: str, joint_names: list[str], args, trigger_point:
         f"({FRACTIONS[trigger_point]*100:.0f}% through). Confirm ready."
     )
 
-    robot.reset()
     robot.clear_abort()
     result = robot.plan_to_configuration({arm: goal}, seed=trial_index)
     if result is None or not getattr(result, "success", False):
@@ -205,6 +332,11 @@ def physical_trial(robot, arm: str, joint_names: list[str], args, trigger_point:
         thread = threading.Thread(target=run_exec, daemon=True)
         thread.start()
         thread.join(timeout=planned_duration + 30.0)
+        # See software_trial()'s identical wait -- without it, the recording
+        # can end before there's enough post-stop data for
+        # settle_time_after() to confirm a genuinely-fine stop.
+        if args.post_abort_settle_s > 0:
+            time.sleep(args.post_abort_settle_s)
         samples = recorder.samples()
         tel.note("planned_duration_s", planned_duration)
 
@@ -240,7 +372,7 @@ def physical_trial(robot, arm: str, joint_names: list[str], args, trigger_point:
     )
 
     print("\nRelease the e-stop per your documented recovery procedure now.")
-    recovery = confirm_step(confirm_recovery(robot))
+    recovery = confirm_step(confirm_recovery(robot, arm, joint_names, args, other_arm, sync_recorder))
 
     passed = step.passed and recovery.passed
     return TrialOutcome(passed, label, latency_msg)
@@ -286,25 +418,52 @@ def main():
     robot = build_robot()
     joint_names = list(getattr(robot, args.arm).arm.config.joint_names)
 
+    # Sync the planning shadow to real hardware feedback before every trial
+    # (both arms -- the untested arm always gets a "hold" trajectory
+    # alongside the tested one) and return to a known safe pose after every
+    # trial -- see common/hardware_sync.py and return_to_zero() above for
+    # why robot.reset() alone doesn't cover this here.
+    other_arm = "right" if args.arm == "left" else "left"
+    all_joint_names = joint_names + list(getattr(robot, other_arm).arm.config.joint_names)
+    sync_recorder = JointStateRecorder(_shared_node, joint_filter=all_joint_names)
+    sync_recorder.start()
+
+    # TODO(review): the trigger-point loop is now inside try/finally --
+    # ported from the identical fix in Stage 6/4. Anything raising
+    # SystemExit in here (software_trial/physical_trial's confirm_phrase
+    # calls, most likely) used to skip executor.shutdown()/
+    # _shared_node.destroy_node() entirely, leaving the daemon spin_thread
+    # (running the blocking executor.spin()) orphaned and still touching
+    # rclpy's C bindings while the interpreter tore them down during
+    # shutdown -- CONFIRMED TO SEGFAULT ON REAL HARDWARE in Stage 6's
+    # version of this exact pattern.
     overall_pass = True
-    for trigger_point in TRIGGER_POINTS:
-        def trial(i: int, tp=trigger_point) -> TrialOutcome:
-            if args.mode == "software":
-                return software_trial(robot, args.arm, joint_names, args, tp, i)
-            return physical_trial(robot, args.arm, joint_names, args, tp, i)
+    try:
+        for trigger_point in TRIGGER_POINTS:
+            def trial(i: int, tp=trigger_point) -> TrialOutcome:
+                sync_shadow_from_hardware(robot, args.arm, sync_recorder)
+                sync_shadow_from_hardware(robot, other_arm, sync_recorder)
+                if args.mode == "software":
+                    outcome = software_trial(robot, args.arm, joint_names, args, tp, i, other_arm, sync_recorder)
+                else:
+                    outcome = physical_trial(robot, args.arm, joint_names, args, tp, i, other_arm, sync_recorder)
+                return_to_zero(robot, args.arm, other_arm, sync_recorder)
+                return outcome
 
-        summary = run_repeated_trials(
-            stage=f"Stage 5 ({args.mode}/{args.arm}/{trigger_point})",
-            trial_fn=trial,
-            required_consecutive=args.repeats_per_point,
-        )
-        overall_pass = overall_pass and summary.reached_target
-        if not summary.reached_target:
-            if not confirm(f"Trigger point '{trigger_point}' did not reach its target. Continue to the next trigger point anyway?", default=False):
-                break
+            summary = run_repeated_trials(
+                stage=f"Stage 5 ({args.mode}/{args.arm}/{trigger_point})",
+                trial_fn=trial,
+                required_consecutive=args.repeats_per_point,
+            )
+            overall_pass = overall_pass and summary.reached_target
+            if not summary.reached_target:
+                if not confirm(f"Trigger point '{trigger_point}' did not reach its target. Continue to the next trigger point anyway?", default=False):
+                    break
+    finally:
+        executor.shutdown()
+        spin_thread.join(timeout=2.0)
+        _shared_node.destroy_node()
 
-    executor.shutdown()
-    _shared_node.destroy_node()
     raise SystemExit(0 if overall_pass else 1)
 
 

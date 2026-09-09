@@ -17,8 +17,33 @@ try:
 except ImportError:
     get_generated_model_path = None
 
-# Fudge factor to scale down the URDF's velocity limits while validating
-SAFETY_SCALE = 1
+# Fudge factor to scale down the URDF's velocity limits while validating.
+#
+# The unscaled numbers below (16.75/5.45/20.94 rad/s, confirmed against
+# vendor/urdf/example/v1.urdf's own <limit velocity="..."> fields -- they
+# are not a typo) are the motors' rated max speeds, not a safe pace for
+# planning/retiming real trajectories during hardware bring-up: at
+# SAFETY_SCALE=1, TOPP-RA retimes a plan_to_configuration() path as fast as
+# these limits allow, producing trajectories on the order of 0.1s for a
+# ~0.3 rad move (~2-3 rad/s effective) -- far faster than this arm's
+# impedance controller can track, and much faster than the ~0.15 rad/s
+# pace already validated as safe in Stage 3 hw_validation
+# (stage3_open_loop_motion.py's ramp_duration_s=2.0 for delta up to 0.3
+# rad).
+#
+# 0.02 (peak ~0.5 rad/s) was the first estimate; real Stage 4 tracking data
+# showed joints 5-7 (kp=10, vs kp=70/60 for joints 1-4 -- see
+# control_gains.yaml) converging too slowly to reach tolerance before the
+# trajectory's nominal duration elapsed, even though 1-4 were fine. That
+# turned out to be static friction/stiction, not raw bandwidth -- the real
+# fix was stage4_trajectory_execution.py's --settle-time-s (extra wait
+# after nominal duration before checking convergence, since the controller
+# declares SUCCESS on elapsed time, not on actually converging), which
+# resolved it independent of trajectory speed. With that in place, back to
+# 0.02 (peak ~0.5 rad/s, still ~30-50x under rated max) for a faster test
+# cycle. Raise further only once tracked execution at this pace is
+# confirmed good and a deliberate decision is made to allow faster motion.
+SAFETY_SCALE = 0.02
 
 # ---------------------------------------------------------------------------
 # Arm specification
@@ -179,9 +204,20 @@ class DebugConfig:
 
 
 _SUBSYSTEM_LOGGERS = {
-    "planning": "openarm.robot",
-    "primitives": "openarm.primitives",
-    "affordances": "openarm.affordances",
+    # "planning" covers both this package's own robot.py AND
+    # mj_manipulator.arm_group, which is where CBiRRT planning failures are
+    # actually diagnosed (_plan_frame_sequence logs a specific reason --
+    # "no collision-free combined goal", "no path", or the raised exception
+    # -- on every failed attempt, including each of the up-to-10 seed
+    # retries plan_to_configuration() does internally). Without this,
+    # OPENARM_DEBUG=planning only unmutes openarm.robot, which never sees
+    # those messages -- mj_manipulator is a separate top-level logger
+    # namespace, not a child of "openarm", so it needs its own handler,
+    # not just a level bump (a level bump alone would still fall through to
+    # logging.lastResort, which is WARNING-level and drops INFO anyway).
+    "planning": ("openarm.robot", "mj_manipulator"),
+    "primitives": ("openarm.primitives",),
+    "affordances": ("openarm.affordances",),
 }
 
 
@@ -190,27 +226,39 @@ def setup_logging(config: DebugConfig | None = None) -> None:
     if config is None:
         config = DebugConfig.from_env()
 
+    fmt_parts = []
+    if config.show_timestamps:
+        fmt_parts.append("%(asctime)s")
+    fmt_parts.append("%(levelname)s")
+    if config.show_module:
+        fmt_parts.append("[%(name)s]")
+    fmt_parts.append("%(message)s")
+    formatter = logging.Formatter(" - ".join(fmt_parts))
+
     root_logger = logging.getLogger("openarm")
     root_logger.propagate = False
 
     if not root_logger.handlers:
         handler = logging.StreamHandler()
-        fmt_parts = []
-        if config.show_timestamps:
-            fmt_parts.append("%(asctime)s")
-        fmt_parts.append("%(levelname)s")
-        if config.show_module:
-            fmt_parts.append("[%(name)s]")
-        fmt_parts.append("%(message)s")
-        handler.setFormatter(logging.Formatter(" - ".join(fmt_parts)))
+        handler.setFormatter(formatter)
         root_logger.addHandler(handler)
 
     root_logger.setLevel(logging.WARNING)
 
     for subsystem in config.get_enabled_subsystems():
-        logger_name = _SUBSYSTEM_LOGGERS.get(subsystem)
-        if logger_name:
-            logging.getLogger(logger_name).setLevel(logging.DEBUG)
+        for logger_name in _SUBSYSTEM_LOGGERS.get(subsystem, ()):
+            subsystem_logger = logging.getLogger(logger_name)
+            subsystem_logger.setLevel(logging.DEBUG)
+            if not logger_name.startswith("openarm") and not subsystem_logger.handlers:
+                # Separate top-level namespace (e.g. mj_manipulator) --
+                # doesn't inherit "openarm"'s handler via propagation, and
+                # without a handler of its own, a message here falls
+                # through to logging.lastResort (WARNING-level) and is
+                # silently dropped even though the level check above passed.
+                subsystem_handler = logging.StreamHandler()
+                subsystem_handler.setFormatter(formatter)
+                subsystem_logger.addHandler(subsystem_handler)
+                subsystem_logger.propagate = False
 
 
 # ---------------------------------------------------------------------------
@@ -357,11 +405,12 @@ class OpenarmConfig:
                 has_gripper=gripper is not None,
                 gripper_open=gripper.finger_open if gripper else 0.0,
                 gripper_closed=gripper.finger_closed if gripper else 0.0,
+                joint_trajectory_controller=f"{name}_controller",
             )
 
         return HardwareConfig(
             arms=[
-                _arm_cfg(self.left_arm, "left_arm"),
-                _arm_cfg(self.right_arm, "right_arm"),
+                _arm_cfg(self.left_arm, "left"),
+                _arm_cfg(self.right_arm, "right"),
             ],
         )
