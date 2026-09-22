@@ -406,6 +406,8 @@ class OpenarmConfig:
                 gripper_open=gripper.finger_open if gripper else 0.0,
                 gripper_closed=gripper.finger_closed if gripper else 0.0,
                 joint_trajectory_controller=f"{name}_joint_trajectory_controller",
+                gripper_interface="follow_joint_trajectory" if gripper is not None else "gripper_command",
+                gripper_joint_name=f"openarm_{name}_finger_joint1" if gripper is not None else None,
             )
 
         return HardwareConfig(
