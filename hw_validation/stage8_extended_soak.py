@@ -72,6 +72,15 @@ def parse_args():
     )
     p.add_argument("--pause-between-ops-s", type=float, default=1.0)
     p.add_argument("--log-dir", default="bringup_logs")
+    p.add_argument(
+        "--reverse-direction", action="store_true",
+        help="Flip the session's fixed draw direction (default: left arm joints move positive, "
+        "right arm joints move negative -- chosen deliberately to keep goals moving away from "
+        "obstacles in the arms' normal starting configuration, not at random). Use this to "
+        "deliberately run a whole session in the opposite direction; it does not randomize "
+        "direction per-op, since drifting either way unpredictably is exactly what the fixed "
+        "convention exists to avoid.",
+    )
     return p.parse_args()
 
 
@@ -86,13 +95,20 @@ def joint_names_for(robot, arm: str) -> list[str]:
     return list(getattr(robot, arm).arm.config.joint_names)
 
 
-def _signed_delta_for_joint(arm: str, joint_name: str, magnitude: float) -> float:
+def _signed_delta_for_joint(arm: str, joint_name: str, magnitude: float, reverse: bool = False) -> float:
     """Same directional convention as stage4_trajectory_execution.py's
     get_signed_delta: left arm joints move positive, right arm joints move
-    negative, except joint6 (always opposite the arm's default sign) and
-    joint4 (always positive -- its real resting position sits right at its
-    own 0.0 lower limit, so a negative draw there is dead-on-arrival)."""
+    negative (or the opposite, for a whole session, if `reverse` is set --
+    this is a deliberate per-session choice, not randomized per-op: the
+    fixed convention exists specifically to keep goals moving away from
+    obstacles near the arms' normal starting configuration, so flipping it
+    per-draw would defeat the point), except joint6 (always opposite the
+    arm's default sign) and joint4 (always positive -- its real resting
+    position sits right at its own 0.0 lower limit, so a negative draw
+    there is dead-on-arrival)."""
     sign = 1.0 if arm == "left" else -1.0
+    if reverse:
+        sign = -sign
     if "joint6" in joint_name:
         sign = -sign
     if "joint4" in joint_name:
@@ -100,7 +116,9 @@ def _signed_delta_for_joint(arm: str, joint_name: str, magnitude: float) -> floa
     return sign * abs(magnitude)
 
 
-def make_goal(robot, arm: str, rng: np.random.Generator, delta: float, max_attempts: int = 20) -> np.ndarray:
+def make_goal(
+    robot, arm: str, rng: np.random.Generator, delta: float, max_attempts: int = 20, reverse: bool = False
+) -> np.ndarray:
     """Draw a random per-joint goal for `arm`, resampling away from
     self-collision or collision with the OTHER arm's current pose -- see
     stage4_trajectory_execution.py's make_goal() for why independent
@@ -116,7 +134,7 @@ def make_goal(robot, arm: str, rng: np.random.Generator, delta: float, max_attem
         for attempt in range(max_attempts):
             magnitudes = rng.uniform(0.0, delta, size=current.shape)
             offset = np.array(
-                [_signed_delta_for_joint(arm, name, mag) for name, mag in zip(joint_names, magnitudes)]
+                [_signed_delta_for_joint(arm, name, mag, reverse) for name, mag in zip(joint_names, magnitudes)]
             )
             candidate = np.clip(current + offset, lower, upper)
             for val, idx in zip(candidate, arm_scope.joint_qpos_indices):
@@ -137,7 +155,7 @@ def make_goal(robot, arm: str, rng: np.random.Generator, delta: float, max_attem
 
 
 def make_concurrent_goals(
-    robot, rng: np.random.Generator, delta: float, max_attempts: int = 20
+    robot, rng: np.random.Generator, delta: float, max_attempts: int = 20, reverse: bool = False
 ) -> tuple[np.ndarray, np.ndarray]:
     """Draw independent left/right goals for a bimanual op, verified
     jointly collision-free with each other (not just individually) -- see
@@ -148,8 +166,8 @@ def make_concurrent_goals(
     goal_l = goal_r = None
     try:
         for attempt in range(max_attempts):
-            goal_l = make_goal(robot, "left", rng, delta)
-            goal_r = make_goal(robot, "right", rng, delta)
+            goal_l = make_goal(robot, "left", rng, delta, reverse=reverse)
+            goal_r = make_goal(robot, "right", rng, delta, reverse=reverse)
             for val, idx in zip(goal_l, left_scope.joint_qpos_indices):
                 robot.data.qpos[idx] = val
             for val, idx in zip(goal_r, right_scope.joint_qpos_indices):
@@ -187,11 +205,11 @@ def load_or_generate_session(robot, args, rng, sync_recorder: JointStateRecorder
     ops = []
     for i in range(6):
         if i % 3 == 2:
-            goal_l, goal_r = make_concurrent_goals(robot, rng, args.goal_delta_rad)
+            goal_l, goal_r = make_concurrent_goals(robot, rng, args.goal_delta_rad, reverse=args.reverse_direction)
             ops.append({"type": "bimanual", "goal_left": goal_l.tolist(), "goal_right": goal_r.tolist()})
         else:
             arm = "left" if i % 2 == 0 else "right"
-            goal = make_goal(robot, arm, rng, args.goal_delta_rad)
+            goal = make_goal(robot, arm, rng, args.goal_delta_rad, reverse=args.reverse_direction)
             ops.append({"type": "single", "arm": arm, "goal": goal.tolist()})
     return ops
 
